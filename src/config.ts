@@ -48,9 +48,22 @@ function need(name: string): string {
   return v;
 }
 
+function optional(name: string): string | null {
+  const v = process.env[name]?.trim();
+  return v && v.length > 0 ? v : null;
+}
+
 // Public, frozen config. Anyone who imports this module triggers the env
 // validation as a side effect — that's deliberate, it's the point.
 export const config = Object.freeze({
   CF_ACCESS_TEAM_DOMAIN: need('CF_ACCESS_TEAM_DOMAIN'),
   CF_ACCESS_AUD: need('CF_ACCESS_AUD'),
+
+  // Optional CSWSH defense-in-depth. If set (e.g. "https://shell.example.com"),
+  // any WS upgrade whose Origin header doesn't match is rejected with 403.
+  // Cloudflare Access's default SameSite=Lax cookie blocks the obvious browser
+  // CSWSH path on its own; this hardens the case where someone configures
+  // SameSite=None on their IdP. Leave unset in dev (page can be loaded via
+  // 127.0.0.1 / `/proxy/<port>/` URLs) so the canonical hostname isn't fixed.
+  ALLOWED_ORIGIN: optional('ALLOWED_ORIGIN'),
 });

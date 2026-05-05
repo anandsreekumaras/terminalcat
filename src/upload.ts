@@ -78,13 +78,28 @@ export function sanitizeName(name: unknown, allowDot = false): { ok: true; name:
   if (name.length > 255) return { ok: false, reason: 'name too long' };
   if (name.includes('\0')) return { ok: false, reason: 'name has NUL byte' };
   if (name.includes('/') || name.includes('\\')) return { ok: false, reason: 'name has path separator' };
-  // Reject control bytes 0x01..0x1F.
+  // Reject control bytes: C0 (0x01..0x1F) and DEL (0x7F).
+  // Earlier the check was just `< 0x20`, which let DEL (and the C1 range
+  // 0x80..0x9F via UTF-8 in some interpretations) through. They don't
+  // enable traversal but they confuse `ls`, completion, and downstream
+  // scripts — easier to reject than to think about.
   for (let i = 0; i < name.length; i++) {
     const c = name.charCodeAt(i);
-    if (c < 0x20) return { ok: false, reason: `name has control byte 0x${c.toString(16)}` };
+    if (c < 0x20 || c === 0x7F) {
+      return { ok: false, reason: `name has control byte 0x${c.toString(16)}` };
+    }
   }
   if (name === '.' || name === '..') return { ok: false, reason: 'name reserved' };
-  if (!allowDot && name.startsWith('.')) return { ok: false, reason: 'leading dot not allowed' };
+  // Leading-dot check, after trimming leading whitespace. Earlier just
+  // `name.startsWith('.')` — that let " .ssh-evil" (note leading space)
+  // through, which doesn't actually shadow `.ssh` (different filename)
+  // but is the kind of confusing-name we'd rather not produce.
+  if (!allowDot) {
+    const trimmed = name.replace(/^\s+/, '');
+    if (trimmed.startsWith('.')) {
+      return { ok: false, reason: 'leading dot not allowed' };
+    }
+  }
   return { ok: true, name };
 }
 
