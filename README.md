@@ -408,8 +408,8 @@ TODO.md               # explicitly out-of-scope items
 | cloudflared tunnel disconnects    | cloudflared retries automatically. No action on terminalcat side — origin stays loopback-only. |
 | WS connection drops mid-session   | Frontend auto-reconnects (exponential backoff, capped 30s). Tabs re-subscribe; xterm content is preserved. |
 | Browser closes                    | tmux session keeps running. Reopen the page → tabs come back, click to reattach. |
-| ⚠️ **Box reboots WITH active tmux sessions**  | tmux server dies with the box; sessions are NOT preserved across hard reboots. To preserve, add [tmux-resurrect / tmux-continuum](https://github.com/tmux-plugins/tmux-resurrect) to your `~/.tmux.conf`. Out of v2 scope. |
-| Disk fills up                     | pino-roll's daily rotation caps total log usage at ~700MB (50MB × 14). Beyond that, writes fail; service may crash; systemd restarts. Set up host-level disk monitoring. |
+| Box reboots WITH active tmux sessions | Run `scripts/install-tmux-persistence.sh` once. It clones tmux-resurrect + tmux-continuum into `~/.tmux/plugins/`, drops a managed block into `~/.tmux.conf`, and turns on auto-save (every 15 min) + auto-restore on tmux start. After that, sessions/windows/panes/cwd come back across reboots. **Caveat that won't go away:** process *state* isn't preserved — a running `nuclei` scan is killed by the reboot; continuum re-runs the command line, which means it starts over. The session *structure* survives. |
+| Disk fills up                     | Three independent gates: (1) `LogRateLimitIntervalSec=1s` + `LogRateLimitBurst=1000` in the unit caps a runaway log loop. (2) Journald has its own `SystemMaxUse=` (default 4GB or 10% of disk; tune via `/etc/systemd/journald.conf`). (3) If you also set `LOG_DIR=`, pino-roll caps file logs at ~700MB (50MB × 14 daily files). Set host-side disk monitoring as a fourth line of defense. |
 | TLS cert / Cloudflare outage      | Origin keeps serving on loopback; users get cloudflared's edge-side error page. Self-heals when CF recovers. |
 
 ### Verifying it's truly auto-running

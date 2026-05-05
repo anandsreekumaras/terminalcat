@@ -77,6 +77,12 @@ TasksMax=4096
 #   range: -1000 (never) … 0 (default) … 1000 (kill first)
 OOMScoreAdjust=-100
 
+# Log-flood guard: a runaway log loop (bug or attack) can fill journald
+# fast. Cap to 1000 lines per second per service. Beyond that systemd
+# rate-limits and adds a "Suppressed N messages" line.
+LogRateLimitIntervalSec=1s
+LogRateLimitBurst=1000
+
 # === sandboxing ==========================================================
 # These are deliberately conservative. terminalcat needs:
 #   - net access (for the JWKS fetch on first JWT verify)
