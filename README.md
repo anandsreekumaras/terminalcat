@@ -164,20 +164,42 @@ cloudflared tunnel create terminalcat       # writes credentials JSON
 cloudflared tunnel route dns terminalcat shell.example.com
 ```
 
-`cloudflared tunnel create` will print a UUID and a path to a credentials
-JSON — paste those into `deploy/cloudflared.yml` (replace the placeholder
-`REPLACE-WITH-YOUR-TUNNEL-UUID` strings).
-
-Then run the tunnel:
+`cloudflared tunnel create` prints a UUID and a path to a credentials JSON.
+Don't edit `deploy/cloudflared.yml` in-place — it's the template that gets
+shared via the repo. Make a per-machine copy in `~/.cloudflared/`:
 
 ```bash
-# foreground (testing):
-cloudflared tunnel --config /home/<user>/terminalcat/deploy/cloudflared.yml run
-
-# or as a systemd service (production — survives reboot):
-sudo cloudflared service install
-# move/symlink deploy/cloudflared.yml to /etc/cloudflared/config.yml first
+mkdir -p ~/.cloudflared
+cp deploy/cloudflared.yml ~/.cloudflared/terminalcat.yml
+$EDITOR ~/.cloudflared/terminalcat.yml
+# replace REPLACE-WITH-YOUR-TUNNEL-UUID (both lines) with the UUID printed above
 ```
+
+Foreground run (good for the first sanity check):
+
+```bash
+cloudflared tunnel --config ~/.cloudflared/terminalcat.yml run
+```
+
+For ongoing use install it as a systemd service so it comes back after
+reboots — `scripts/install.sh` does this for you when `~/.cloudflared/terminalcat.yml`
+exists. Manual install:
+
+```bash
+sudo cp deploy/cloudflared-terminalcat.service /etc/systemd/system/
+sudo sed -i "s|^User=ubuntu|User=$USER|;s|^Group=ubuntu|Group=$(id -gn)|;s|/home/ubuntu/.cloudflared|$HOME/.cloudflared|g" \
+  /etc/systemd/system/cloudflared-terminalcat.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared-terminalcat.service
+sudo journalctl -u cloudflared-terminalcat -f   # tail logs to confirm
+```
+
+> ⚠️ **Don't use `sudo cloudflared service install`.** That command installs
+> a single token-based unit and either collides with or overwrites any
+> existing `cloudflared.service` you have (e.g. for another tunnel).
+> The dedicated `cloudflared-terminalcat.service` above sits cleanly
+> alongside, uses the credentials-file pattern (no rotating tokens),
+> and runs as your unprivileged user.
 
 ### 3. Create the Cloudflare Access application
 

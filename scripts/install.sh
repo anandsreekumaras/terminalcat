@@ -402,6 +402,68 @@ ask_systemd() {
   fi
 }
 
+# ===== cloudflared tunnel as a separate systemd service ===================
+# Installs `deploy/cloudflared-terminalcat.service` if the user has already
+# created their tunnel and config. Skips quietly if cloudflared isn't on
+# the box yet, or if there's no ~/.cloudflared/terminalcat.yml — the
+# next-steps summary tells the user how to come back.
+#
+# Why NOT `cloudflared service install`: that command installs ONE
+# token-based unit and either collides with or overwrites any existing
+# cloudflared.service on the box (e.g. one for codeserver). A dedicated,
+# distinctly-named unit sits cleanly alongside.
+ask_tunnel_systemd() {
+  echo
+  if ! command -v systemctl >/dev/null 2>&1; then
+    info "systemd not present — skipping cloudflared tunnel service install"
+    return
+  fi
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    info "cloudflared missing — skipping tunnel service. Install cloudflared, then re-run."
+    return
+  fi
+  local cfg="$HOME/.cloudflared/terminalcat.yml"
+  if [ ! -f "$cfg" ]; then
+    info "cloudflared tunnel config $cfg not yet created — skipping tunnel service."
+    info "  Run, in order:"
+    info "    cloudflared login                              # one-time browser SSO"
+    info "    cloudflared tunnel create terminalcat          # writes credentials JSON"
+    info "    cloudflared tunnel route dns terminalcat shell.YOUR-DOMAIN"
+    info "    mkdir -p ~/.cloudflared"
+    info "    cp $INSTALL_DIR/deploy/cloudflared.yml $cfg"
+    info "    \$EDITOR $cfg                                  # paste the UUID"
+    info "    re-run this installer to register the tunnel as a systemd service."
+    return
+  fi
+  if ! confirm "install systemd service for the cloudflared tunnel (so it survives reboot)?"; then
+    info "skipping. To install later:"
+    info "    sudo cp $INSTALL_DIR/deploy/cloudflared-terminalcat.service /etc/systemd/system/"
+    info "    sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared-terminalcat.service"
+    return
+  fi
+
+  local svc_src="$INSTALL_DIR/deploy/cloudflared-terminalcat.service"
+  local svc_dst="/etc/systemd/system/cloudflared-terminalcat.service"
+  info "templating $svc_src → $svc_dst (User=$USER, config=$cfg)"
+  need_sudo
+  sudo cp "$svc_src" "$svc_dst"
+  sudo sed -i "s|^User=ubuntu|User=$USER|"                       "$svc_dst"
+  sudo sed -i "s|^Group=ubuntu|Group=$(id -gn)|"                 "$svc_dst"
+  sudo sed -i "s|/home/ubuntu/.cloudflared|$HOME/.cloudflared|g" "$svc_dst"
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now cloudflared-terminalcat.service
+
+  sleep 1
+  if sudo systemctl is-active --quiet cloudflared-terminalcat.service; then
+    ok "cloudflared-terminalcat.service running"
+    info "logs: \`sudo journalctl -u cloudflared-terminalcat -f\`"
+  else
+    red "  ✗ cloudflared-terminalcat.service failed to start"
+    info "diagnose: \`sudo systemctl status cloudflared-terminalcat\` / \`sudo journalctl -u cloudflared-terminalcat --no-pager -n 40\`"
+  fi
+}
+
 # ===== shims ==============================================================
 ask_shims() {
   echo
@@ -425,17 +487,26 @@ print_next_steps() {
   blue  "  Bound to:  http://127.0.0.1:7682  (loopback only)"
   echo
   cyan  "  What's left to do (one-time, on your Cloudflare account):"
-  echo  "  1. Create a tunnel:"
-  echo  "       cloudflared login"
-  echo  "       cloudflared tunnel create terminalcat"
+  echo  "  1. Create a tunnel + DNS route:"
+  echo  "       cloudflared login                                  # one-time browser SSO"
+  echo  "       cloudflared tunnel create terminalcat              # writes credentials JSON"
   echo  "       cloudflared tunnel route dns terminalcat shell.YOUR-DOMAIN"
-  echo  "  2. Edit $INSTALL_DIR/deploy/cloudflared.yml — paste the tunnel UUID + creds path"
-  echo  "  3. Run the tunnel:"
-  echo  "       cloudflared tunnel --config $INSTALL_DIR/deploy/cloudflared.yml run"
-  echo  "       # (or 'sudo cloudflared service install' for a systemd-managed tunnel)"
+  echo  "  2. Make a per-machine config from the template:"
+  echo  "       mkdir -p ~/.cloudflared"
+  echo  "       cp $INSTALL_DIR/deploy/cloudflared.yml ~/.cloudflared/terminalcat.yml"
+  echo  "       \$EDITOR ~/.cloudflared/terminalcat.yml             # paste the tunnel UUID"
+  echo  "  3. Re-run THIS installer once that file exists — it'll register the tunnel"
+  echo  "       as a systemd service (cloudflared-terminalcat.service) so it survives"
+  echo  "       reboots. For testing without systemd:"
+  echo  "       cloudflared tunnel --config ~/.cloudflared/terminalcat.yml run"
   echo  "  4. Create a Cloudflare Access app for shell.YOUR-DOMAIN"
   echo  "     (Zero Trust dashboard → Access → Applications → Self-hosted, allow your email)"
   echo  "  5. Visit https://shell.YOUR-DOMAIN → SSO login → terminal."
+  echo
+  yellow "  ⚠ DON'T use \`sudo cloudflared service install\` — that command installs a"
+  yellow "    token-based unit that collides with any existing cloudflared.service on"
+  yellow "    the box, and uses tokens (rotate on dashboard refresh) instead of the"
+  yellow "    credentials-file pattern this project ships."
   echo
   cyan  "  Full walkthrough in $INSTALL_DIR/README.md"
   echo
@@ -470,6 +541,7 @@ main() {
   echo
   cyan "Step 6/6 — service + shims"
   ask_systemd
+  ask_tunnel_systemd
   ask_shims
   print_next_steps
 }
