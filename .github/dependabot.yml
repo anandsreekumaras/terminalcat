@@ -1,0 +1,53 @@
+# Dependabot keeps the deps current — files PRs when a new version of any
+# dependency ships. Particularly important for things that touch the auth
+# / WS / PTY path: jose, ws, node-pty, xterm.js. CI (.github/workflows/ci.yml)
+# type-checks every PR so a breaking-change bump fails loudly.
+#
+# Schedule is weekly to avoid getting flooded; bump to daily if you'd like
+# faster CVE response.
+
+version: 2
+updates:
+  # Node deps in the project root (package.json + pnpm-lock.yaml)
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      # Cluster runtime libs together so they update in a single PR
+      # instead of seven simultaneous tiny ones.
+      runtime:
+        patterns:
+          - "node-pty"
+          - "ws"
+          - "jose"
+          - "zod"
+          - "pino"
+          - "pino-roll"
+      types:
+        patterns:
+          - "@types/*"
+      tooling:
+        patterns:
+          - "tsx"
+          - "typescript"
+
+  # GitHub Actions versions in any workflow YAMLs we add later
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci

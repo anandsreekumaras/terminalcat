@@ -1,0 +1,91 @@
+# systemd unit for terminalcat.
+#
+# This file is GENERATED — review and copy it into place rather than
+# letting `pnpm` install it. Suggested install:
+#
+#   sudo cp deploy/terminalcat.service /etc/systemd/system/terminalcat.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now terminalcat.service
+#
+# Reload after edits:
+#   sudo systemctl daemon-reload && sudo systemctl restart terminalcat
+#
+# Logs:
+#   sudo journalctl -u terminalcat.service -f
+#   ls /var/log/terminalcat   # only if LOG_DIR is set in EnvironmentFile
+
+[Unit]
+Description=terminalcat — self-hosted web terminal
+Documentation=https://github.com/your-fork-of-terminalcat
+# We only depend on basic networking. The cloudflared tunnel is its
+# OWN systemd unit (cloudflared.service); they don't need to start in
+# any particular order — terminalcat binds 127.0.0.1 only, and
+# cloudflared retries until our origin comes up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# DO NOT run as root. Pick the user that owns the terminalcat tree and
+# whose tmux server you want sessions to live under. The user must have
+# read access to its .env, write access to LOG_DIR if set, and (for the
+# webdl shim's UNIX socket) ownership of $XDG_RUNTIME_DIR.
+User=ubuntu
+Group=ubuntu
+
+WorkingDirectory=/home/ubuntu/terminalcat
+EnvironmentFile=/home/ubuntu/terminalcat/.env
+
+# Run tsx directly. node_modules/.bin/tsx is a POSIX shell wrapper that
+# re-execs node with the right loader; systemd executes it via its
+# shebang. Don't prepend `node` — node would try to parse the shell
+# wrapper as JS and fail with "SyntaxError: missing ) after argument list".
+#
+# To run a compiled build instead, do `pnpm exec tsc -p .` once and swap to:
+#   ExecStart=/usr/bin/node /home/ubuntu/terminalcat/dist/server.js
+ExecStart=/home/ubuntu/terminalcat/node_modules/.bin/tsx src/server.ts
+
+# Graceful shutdown: SIGTERM, our handler closes WS, SIGHUPs PTYs,
+# closes the HTTP server. We give it 7s before SIGKILL — our internal
+# deadline is 5s.
+KillSignal=SIGTERM
+TimeoutStopSec=7
+KillMode=mixed
+
+Restart=always
+RestartSec=2
+
+# === sandboxing ==========================================================
+# These are deliberately conservative. terminalcat needs:
+#   - net access (for the JWKS fetch on first JWT verify)
+#   - read access to PUBLIC_DIR (the served static frontend)
+#   - read+write to LOG_DIR if set
+#   - exec of `tmux`
+#   - read of ~/.cloudflared (tunnel cred) only if you're using a CLI-
+#     managed tunnel; the dashboard-token tunnel doesn't need it
+#
+# Loosen any of these if you find the service failing to start —
+# `journalctl -u terminalcat` shows the SECCOMP/EACCES denials.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow writing only into the project tree + /tmp (for the shim socket
+# /tmp/terminalcat-<uid>.sock).  Skipping /run/user/<uid> because
+# headless service users don't have a logind session, so that directory
+# may not exist when the unit starts.
+ReadWritePaths=/home/ubuntu/terminalcat /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# node-pty / V8 JIT need rwx pages — leave MemoryDenyWriteExecute off.
+MemoryDenyWriteExecute=false
+# webdl uses /tmp/terminalcat-<uid>.sock — keep /tmp shared, not private.
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

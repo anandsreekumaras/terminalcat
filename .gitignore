@@ -1,0 +1,32 @@
+# dependencies + build output
+node_modules/
+dist/
+.pnpm-store/
+
+# secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+/var/log/
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# personal scratch — not part of the project
+res.sh
+scratch/
+
+# Claude Code local project settings — per-machine, not part of the repo
+.claude/
+
+# dev artifacts that don't belong in the repo
+/tmp/
+*.uploading

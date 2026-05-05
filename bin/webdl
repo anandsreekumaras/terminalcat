@@ -1,0 +1,60 @@
+#!/usr/bin/env node
+// webdl <file> — stream a file from the box to the browser via terminalcat.
+//
+// Must be run inside a tmux session (uses $TMUX to identify the session).
+// Talks to the server's UNIX socket. Server pushes the file to whoever is
+// attached to that session in their browser.
+
+'use strict';
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+function die(msg, code = 1) {
+  process.stderr.write(`webdl: ${msg}\n`);
+  process.exit(code);
+}
+
+if (!process.env.TMUX) die('not inside tmux ($TMUX unset). Run this inside a terminalcat-managed tmux session.');
+if (process.argv.length < 3) die(`usage: ${path.basename(process.argv[1])} <file>`);
+
+const arg = process.argv[2];
+let abs;
+try { abs = fs.realpathSync(arg); }
+catch (e) { die(`${arg}: ${e.message}`); }
+
+let session;
+try {
+  session = execFileSync('tmux', ['display-message', '-p', '#{session_name}'], { encoding: 'utf8' }).trim();
+} catch (e) {
+  die(`tmux display-message failed: ${e.message}`);
+}
+if (!session) die("couldn't determine tmux session name");
+
+const xdg = process.env.XDG_RUNTIME_DIR;
+const sockPath = (xdg && fs.existsSync(xdg))
+  ? path.join(xdg, 'terminalcat.sock')
+  : `/tmp/terminalcat-${process.getuid ? process.getuid() : 0}.sock`;
+
+if (!fs.existsSync(sockPath)) die(`server socket not found at ${sockPath} (is terminalcat running?)`);
+
+const conn = net.connect(sockPath);
+let buf = '';
+conn.on('connect', () => {
+  conn.write(JSON.stringify({ action: 'download', sessionId: session, path: abs }) + '\n');
+});
+conn.on('data', (d) => { buf += d.toString('utf8'); });
+conn.on('end', () => {
+  const line = buf.split('\n').find((s) => s.trim().length > 0) || '';
+  let reply;
+  try { reply = JSON.parse(line); } catch { reply = null; }
+  if (!reply) die('no reply from server');
+  if (reply.ok) {
+    process.stdout.write(`webdl: queued ${abs}\n`);
+    process.exit(0);
+  } else {
+    die(reply.error || 'unknown error');
+  }
+});
+conn.on('error', (e) => die(`socket: ${e.message}`));

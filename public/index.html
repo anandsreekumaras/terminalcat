@@ -1,0 +1,2232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>terminalcat</title>
+
+  <!--
+    C10 — multi-tab UI (mobile-aware) on top of the C8 framed-protocol +
+    C9 multi-session backend. Wire spec: PROTOCOL.md.
+
+    Layout (top to bottom):
+      [#tab-bar]      horizontal-scrolling list of session tabs + "+"
+      [#panes]        stack of xterm panes (one per tab — only active is shown)
+      [#helper-bar]   on-screen-keyboard helpers (sticky Ctrl/Alt etc)
+
+    Tabs:
+      - "+" prompts for a session id and creates it
+      - Click switches; active is highlighted and scrolled into view
+      - Long-press / right-click opens a per-tab menu (Detach, Kill)
+      - Inactive tabs with new output show an activity dot
+      - Reload restores the *list* of tabs from `session-list`, then attaches
+        only the last-active one (other tabs are placeholders until clicked)
+
+    Memory note (per spec): scrollback × tabs is real cost. We keep
+    `scrollback: 1000` (configurable in the THEME/UI section) and lazy-
+    attach: a tab without an attached session has no xterm and no PTY.
+  -->
+
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0c0c0c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="terminalcat">
+  <meta name="mobile-web-app-capable" content="yes">
+
+  <!--
+    crossorigin=use-credentials forces the browser to send cookies on the
+    manifest fetch. Without it, browsers fetch the manifest in `omit`
+    credentials mode, the CF Access cookie isn't sent, the request hits
+    CF's login redirect, and the cross-origin response triggers a CORS
+    error in DevTools. With this attribute the manifest is fetched as
+    "logged-in" and Access lets it through.
+  -->
+  <link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="apple-touch-icon" href="icon.svg">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css">
+
+  <style>
+    :root {
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-right: env(safe-area-inset-right, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-left: env(safe-area-inset-left, 0px);
+    }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #0c0c0c;
+      color: #c0caf5;
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+      overscroll-behavior: contain;
+      touch-action: manipulation;
+      /* iOS long-press callout (Copy/Look up/Share/etc.) — disabled at the
+         body level so it doesn't compete with our action sheet. Specific
+         elements that NEED the native callout (none in v1) can re-enable. */
+      -webkit-touch-callout: none;
+      /* UI chrome is non-selectable by default. The terminal itself
+         re-enables selection via .pane / .xterm rules below. Without this,
+         a drag-select that strays out of the terminal pane was bleeding
+         the highlight into the helper bar / info bar / detached bar. */
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+      padding-top: var(--safe-top);
+      padding-left: var(--safe-left);
+      padding-right: var(--safe-right);
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+
+    /* ===== tab bar ====================================================== */
+    #tab-bar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: stretch;
+      background: #15161e;
+      border-bottom: 1px solid #2c2e3e;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      /* `touch-action: pan-x` allows horizontal swipe to scroll the tab
+         bar. Without it, body's `manipulation` propagates and the swipe
+         is consumed before the bar can scroll. */
+      touch-action: pan-x;
+    }
+    #tab-bar::-webkit-scrollbar { display: none; }
+
+    .tab {
+      flex: 0 0 auto;
+      max-width: 200px;
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #a9b1d6;
+      border-right: 1px solid #2c2e3e;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      font: 13px ui-monospace, Menlo, Consolas, monospace;
+      white-space: nowrap;
+      touch-action: manipulation;
+    }
+    .tab:active { background: #1a1b26; }
+    .tab.active {
+      background: #0c0c0c;
+      color: #c0caf5;
+      box-shadow: inset 0 -2px 0 #7aa2f7;
+    }
+    .tab-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 140px;
+    }
+    .tab-status {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: transparent;
+      flex-shrink: 0;
+    }
+    .tab.has-activity:not(.active) .tab-status { background: #9ece6a; }
+    .tab.dormant .tab-title { color: #6a7088; font-style: italic; }
+
+    .tab-add {
+      flex: 0 0 auto;
+      padding: 4px 14px;
+      background: transparent;
+      color: #7aa2f7;
+      border: none;
+      cursor: pointer;
+      font: 18px/1 ui-monospace, monospace;
+      align-self: stretch;
+    }
+    .tab-add:active { background: #1a1b26; }
+
+    /* ===== panes (one xterm per session, only active visible) =========== */
+    #panes {
+      flex: 1 1 auto;
+      position: relative;
+      min-height: 0;
+    }
+    .pane {
+      position: absolute;
+      inset: 0;
+      padding: 4px;
+      box-sizing: border-box;
+      display: none;
+    }
+    .pane.active { display: block; }
+    .pane-empty {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 8px;
+      color: #6a7088;
+      font: 13px ui-monospace, monospace;
+      pointer-events: none;
+    }
+
+    /* iOS callout off; selection still works for copy-from-terminal. */
+    .pane, .xterm, .xterm-viewport, .xterm-screen {
+      -webkit-touch-callout: none;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .xterm, .xterm-viewport, .xterm-screen { height: 100%; }
+    /* Allow vertical pan for touch scroll inside the terminal viewport.
+       Body has touch-action: manipulation (no pinch-zoom); this overrides
+       so swipes scroll the terminal/tmux scrollback. */
+    .xterm-viewport { touch-action: pan-y !important; }
+
+    /* ===== helper bar (bottom) ========================================== */
+    #helper-bar {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 4px;
+      padding: 6px;
+      padding-left: calc(6px + var(--safe-left));
+      padding-right: calc(6px + var(--safe-right));
+      padding-bottom: calc(6px + var(--safe-bottom));
+      background: #15161e;
+      border-top: 1px solid #2c2e3e;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      position: relative;
+      /* Same reason as #tab-bar — allow horizontal swipe to scroll the
+         row of helper keys. */
+      touch-action: pan-x;
+    }
+    #helper-bar::-webkit-scrollbar { display: none; }
+
+    .key-btn {
+      flex: 0 0 auto;
+      min-width: 42px;
+      height: 36px;
+      padding: 0 10px;
+      background: #2c2e3e;
+      color: #c0caf5;
+      border: none;
+      border-radius: 6px;
+      font: 13px/1 ui-monospace, Menlo, Consolas, monospace;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+    .key-btn:active { background: #3b4261; }
+    .key-btn.sticky-on { background: #7aa2f7; color: #0c0c0c; font-weight: bold; }
+
+    /* ===== action sheet (long-press on terminal) ======================== */
+    #action-sheet {
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      z-index: 100;
+      background: #1a1b26;
+      border-top: 1px solid #2c2e3e;
+      padding: 12px;
+      padding-left: calc(12px + var(--safe-left));
+      padding-right: calc(12px + var(--safe-right));
+      padding-bottom: calc(12px + var(--safe-bottom));
+      transform: translateY(110%);
+      transition: transform 0.18s ease-out;
+    }
+    #action-sheet.open { transform: translateY(0); }
+    #action-sheet button {
+      display: block;
+      width: 100%;
+      padding: 14px;
+      margin-bottom: 6px;
+      background: #2c2e3e;
+      color: #c0caf5;
+      border: none;
+      border-radius: 8px;
+      font: 15px -apple-system, system-ui;
+      text-align: left;
+    }
+    #action-sheet button.danger { color: #f7768e; }
+    #action-sheet button[data-action="cancel"] {
+      margin-top: 8px;
+      text-align: center;
+      background: #15161e;
+    }
+    #action-sheet h3 {
+      margin: 0 0 8px 0;
+      font: 13px -apple-system, system-ui;
+      color: #6a7088;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    #action-sheet-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.18s ease-out;
+      z-index: 99;
+    }
+    #action-sheet-overlay.open { opacity: 1; pointer-events: auto; }
+
+    /* ===== reconnect banner ============================================ */
+    #conn-status {
+      position: fixed;
+      top: calc(var(--safe-top) + 4px);
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 6px 12px;
+      background: rgba(247, 118, 142, 0.92);
+      color: #15161e;
+      border-radius: 14px;
+      font: 12px ui-monospace, monospace;
+      z-index: 110;
+      display: none;
+    }
+    #conn-status.show { display: block; }
+
+    /* ===== transfer cards (uploads + downloads) ======================== */
+    #transfers {
+      position: fixed;
+      right: calc(8px + var(--safe-right));
+      bottom: calc(56px + var(--safe-bottom));
+      display: flex;
+      flex-direction: column-reverse;
+      gap: 6px;
+      z-index: 90;
+      max-width: min(360px, 90vw);
+    }
+    .transfer {
+      background: #1a1b26;
+      border: 1px solid #2c2e3e;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: 12px ui-monospace, monospace;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    .transfer-name {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      color: #c0caf5;
+    }
+    .transfer-name .pct { color: #7aa2f7; }
+    .transfer-bar {
+      height: 4px;
+      background: #2c2e3e;
+      border-radius: 2px;
+      margin-top: 6px;
+      overflow: hidden;
+    }
+    .transfer-bar-fill {
+      height: 100%;
+      width: 0;
+      background: #7aa2f7;
+      transition: width 0.15s linear;
+    }
+    .transfer.error .transfer-bar-fill { background: #f7768e; }
+    .transfer.done   .transfer-bar-fill { background: #9ece6a; }
+
+    /* ===== search bar (Ctrl+Shift+F) =================================== */
+    #search-bar {
+      position: fixed;
+      top: calc(var(--safe-top) + 6px);
+      right: calc(var(--safe-right) + 6px);
+      z-index: 95;
+      display: none;
+      align-items: center;
+      gap: 4px;
+      background: #1a1b26;
+      border: 1px solid #2c2e3e;
+      border-radius: 6px;
+      padding: 4px 6px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+    #search-bar.show { display: flex; }
+    #search-bar input {
+      width: 220px;
+      padding: 4px 8px;
+      background: #0c0c0c;
+      color: #c0caf5;
+      border: 1px solid #2c2e3e;
+      border-radius: 4px;
+      font: 13px ui-monospace, monospace;
+      outline: none;
+    }
+    #search-bar button {
+      width: 28px; height: 28px;
+      background: #2c2e3e;
+      color: #c0caf5;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    /* ===== drag-and-drop highlight on terminal ========================= */
+    #panes.drag-over {
+      box-shadow: inset 0 0 0 3px #7aa2f7;
+    }
+    #drop-hint {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(122, 162, 247, 0.15);
+      color: #c0caf5;
+      font: 18px -apple-system, system-ui;
+      z-index: 50;
+    }
+    #panes.drag-over #drop-hint { display: flex; }
+
+    /* ===== "tab cwd" subtitle in tab title ============================= */
+    .tab-cwd {
+      color: #6a7088;
+      margin-left: 6px;
+      font-size: 11px;
+      max-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tab.dormant .tab-cwd { display: none; }
+    /* Hide dormant tabs from the top bar — they re-appear as chips in
+       the bottom #detached-bar so the top stays focused on what's live. */
+    .tab.dormant { display: none; }
+
+    /* ===== detached-sessions bar (bottom, above helper bar) ============ */
+    #detached-bar {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 6px;
+      padding: 4px calc(6px + var(--safe-left)) 4px calc(6px + var(--safe-right));
+      background: #1a1b26;
+      border-top: 1px solid #2c2e3e;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      touch-action: pan-x;
+      align-items: center;
+      min-height: 28px;
+    }
+    #detached-bar::-webkit-scrollbar { display: none; }
+    /* When there are no detached sessions, hide the whole bar — no
+       wasted screen real-estate. */
+    #detached-bar:empty { display: none; }
+    .det-label {
+      flex: 0 0 auto;
+      color: #6a7088;
+      font: 11px ui-monospace, monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-right: 4px;
+      user-select: none;
+    }
+    .det-chip {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: stretch;
+      background: #2c2e3e;
+      border-radius: 10px;
+      overflow: hidden;
+      font: 12px ui-monospace, monospace;
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+      white-space: nowrap;
+    }
+    .det-attach {
+      padding: 4px 4px 4px 10px;
+      color: #a9b1d6;
+      cursor: pointer;
+    }
+    .det-attach::before { content: '↶ '; color: #7aa2f7; }
+    .det-attach:hover { color: #c0caf5; background: #3b4261; }
+    .det-kill {
+      padding: 0 9px 0 7px;
+      background: transparent;
+      border: none;
+      color: #6a7088;
+      cursor: pointer;
+      font: inherit;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      border-left: 1px solid #1a1b26;
+    }
+    .det-kill:hover { color: #f7768e; background: #3b4261; }
+
+    /* ===== info bar (replaces tmux status) ============================ */
+    #info-bar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 4px 10px;
+      padding-left: calc(10px + var(--safe-left));
+      padding-right: calc(10px + var(--safe-right));
+      background: #1f2335;
+      color: #a9b1d6;
+      font: 11px ui-monospace, Menlo, Consolas, monospace;
+      border-top: 1px solid #2c2e3e;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .info-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .info-pill .icon { color: #9ece6a; }
+    .info-pill.muted { color: #6a7088; }
+    .info-pill.muted .icon { color: #6a7088; }
+
+    /* ===== context menu (right-click on desktop) =======================
+       Long-press on mobile keeps using the bottom sheet — bigger touch
+       targets are easier on a phone. This is the desktop sibling. */
+    #ctx-menu {
+      position: fixed;
+      z-index: 200;
+      min-width: 180px;
+      background: #1a1b26;
+      border: 1px solid #2c2e3e;
+      border-radius: 6px;
+      padding: 4px 0;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+      display: none;
+      font: 13px -apple-system, system-ui;
+    }
+    #ctx-menu.show { display: block; }
+    #ctx-menu button {
+      display: block;
+      width: 100%;
+      padding: 7px 14px;
+      background: transparent;
+      color: #c0caf5;
+      border: none;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      white-space: nowrap;
+    }
+    #ctx-menu button:hover { background: #2c2e3e; }
+    #ctx-menu button.danger { color: #f7768e; }
+    #ctx-menu button:disabled { color: #6a7088; cursor: default; }
+    #ctx-menu button:disabled:hover { background: transparent; }
+    #ctx-menu .ctx-sep {
+      height: 1px;
+      background: #2c2e3e;
+      margin: 4px 0;
+    }
+    #ctx-menu .ctx-shortcut {
+      color: #6a7088;
+      margin-left: 24px;
+      float: right;
+    }
+  </style>
+</head>
+
+<body>
+  <nav id="tab-bar" aria-label="Sessions">
+    <!-- Tabs added dynamically; "+" pinned to the right end of the row. -->
+    <button class="tab-add" id="tab-add" aria-label="New session">+</button>
+  </nav>
+
+  <main id="panes">
+    <!-- pane elements appended dynamically by Session class. -->
+    <div class="pane-empty" id="pane-empty">connecting…</div>
+    <!-- Drag-and-drop hint — only visible while a file is being dragged. -->
+    <div id="drop-hint">drop file to upload</div>
+  </main>
+
+  <!-- Hidden file input for the "+ upload" button on mobile. We don't
+       drop on phones (no real DnD); button-driven instead. -->
+  <input type="file" id="file-input" multiple style="display:none">
+
+  <!-- Connection-status banner (auto-reconnect). -->
+  <div id="conn-status"></div>
+
+  <!-- Floating transfer cards (uploads + downloads stack here). -->
+  <aside id="transfers" aria-live="polite"></aside>
+
+  <!-- Search bar — Ctrl+Shift+F to toggle. -->
+  <form id="search-bar" onsubmit="return false;">
+    <input id="search-input" type="text" placeholder="search scrollback" autocomplete="off">
+    <button type="button" id="search-prev" title="Previous (Shift+Enter)">↑</button>
+    <button type="button" id="search-next" title="Next (Enter)">↓</button>
+    <button type="button" id="search-close" title="Close (Esc)">×</button>
+  </form>
+
+  <!-- Bottom bar showing tabs that have been detached (dormant). Click
+       to reattach, × to kill. Empty -> entire bar hides via CSS. -->
+  <nav id="detached-bar" aria-label="Detached sessions"></nav>
+
+  <!-- Info strip: replaces tmux's green status bar. Shows the active
+       session, its cwd, the device-count for that session, and the
+       Cf-Connecting-Ip the server saw on connect. -->
+  <aside id="info-bar" aria-live="polite"></aside>
+
+  <nav id="helper-bar" aria-label="Modifier keys">
+    <button class="key-btn" data-key="Escape">Esc</button>
+    <button class="key-btn" data-key="Tab">Tab</button>
+    <button class="key-btn" data-mod="ctrl">Ctrl</button>
+    <button class="key-btn" data-mod="alt">Alt</button>
+    <button class="key-btn" data-key="ArrowUp" aria-label="Up">↑</button>
+    <button class="key-btn" data-key="ArrowDown" aria-label="Down">↓</button>
+    <button class="key-btn" data-key="ArrowLeft" aria-label="Left">←</button>
+    <button class="key-btn" data-key="ArrowRight" aria-label="Right">→</button>
+    <button class="key-btn" data-combo="ctrl-a">^A</button>
+    <button class="key-btn" data-combo="ctrl-c">^C</button>
+    <button class="key-btn" data-combo="ctrl-d">^D</button>
+    <button class="key-btn" id="btn-upload"   title="Upload file">⇪</button>
+    <button class="key-btn" id="btn-snippets" title="Snippets">⌘</button>
+    <button class="key-btn" id="btn-search"   title="Search (Ctrl+Shift+F)">⌕</button>
+    <button class="key-btn sticky-on" id="btn-mouse"
+            title="Tmux mouse: ON (scroll = scrollback). Tap to switch to native mouse selection.">🖱</button>
+  </nav>
+
+  <!-- Action sheet (mobile long-press): big buttons, full width, easy
+       on the thumb. Populated dynamically — different items for terminal
+       vs tab long-press. -->
+  <div id="action-sheet" role="dialog" aria-hidden="true"></div>
+  <div id="action-sheet-overlay"></div>
+
+  <!-- Right-click context menu (desktop): small Windows-style at the
+       cursor. Populated dynamically — same set of items as the mobile
+       action sheet, but compact. -->
+  <div id="ctx-menu" role="menu" aria-hidden="true"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.12.0/lib/addon-web-links.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.19.0/lib/addon-webgl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-search@0.16.0/lib/addon-search.js"></script>
+
+  <script>
+    'use strict';
+
+    // ===== theme + font ===================================================
+    const THEME = {
+      background: '#0c0c0c',
+      foreground: '#c0caf5',
+      cursor: '#7aa2f7',
+      cursorAccent: '#0c0c0c',
+      selectionBackground: '#283457',
+      black: '#15161e',
+      red: '#f7768e',
+      green: '#9ece6a',
+      yellow: '#e0af68',
+      blue: '#7aa2f7',
+      magenta: '#bb9af7',
+      cyan: '#7dcfff',
+      white: '#a9b1d6',
+      brightBlack: '#414868',
+      brightRed: '#ff7a93',
+      brightGreen: '#b9f27c',
+      brightYellow: '#ff9e64',
+      brightBlue: '#7da6ff',
+      brightMagenta: '#bb9af7',
+      brightCyan: '#0db9d7',
+      brightWhite: '#c0caf5',
+    };
+    const SCROLLBACK = 1000;
+    const FONT_KEY = 'tc.fontSize';
+    const FONT_MIN = 10, FONT_MAX = 24, FONT_DEFAULT = 14;
+    const ACTIVE_KEY = 'tc.activeSession';
+    const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+    function loadFontSize() {
+      const raw = parseInt(localStorage.getItem(FONT_KEY) ?? '', 10);
+      return Number.isFinite(raw) ? clamp(raw, FONT_MIN, FONT_MAX) : FONT_DEFAULT;
+    }
+
+    // ===== WS (with auto-reconnect) =======================================
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    let ws = null;
+    let reconnectMs = 1000;
+    const RECONNECT_MAX_MS = 30000;
+    const connBanner = document.getElementById('conn-status');
+
+    function showConnBanner(text) {
+      connBanner.textContent = text;
+      connBanner.classList.add('show');
+    }
+    function hideConnBanner() {
+      connBanner.classList.remove('show');
+    }
+
+    function connect() {
+      const wsBase = new URL('.', location.href);
+      wsBase.protocol = wsBase.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(wsBase.toString());
+      ws.binaryType = 'arraybuffer';
+      wireWs(ws);
+    }
+
+    function scheduleReconnect() {
+      const ms = reconnectMs;
+      reconnectMs = Math.min(reconnectMs * 2, RECONNECT_MAX_MS);
+      showConnBanner(`reconnecting in ${(ms/1000).toFixed(0)}s…`);
+      setTimeout(() => {
+        // Defer if the tab is hidden — saves battery and avoids
+        // bouncing when the user comes back from a long lock-screen.
+        if (document.visibilityState === 'hidden') {
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') connect();
+          }, { once: true });
+        } else {
+          connect();
+        }
+      }, ms);
+    }
+
+    function sendCtrl(obj) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify(obj));
+    }
+
+    /** Encode and send a STDIN data frame for `id`. */
+    function sendStdin(id, payload) {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const sidBytes = enc.encode(id);
+      const data = typeof payload === 'string' ? enc.encode(payload) : payload;
+      const out = new Uint8Array(2 + sidBytes.length + data.length);
+      out[0] = 0x01;                  // STDIN
+      out[1] = sidBytes.length;
+      out.set(sidBytes, 2);
+      out.set(data, 2 + sidBytes.length);
+      ws.send(out);
+    }
+
+    /**
+     * Paste a text blob as stdin, with two safeguards:
+     *   1. Wrap in bracketed-paste markers (\e[200~ … \e[201~) so a
+     *      multi-line clipboard doesn't *execute* commands on every \n —
+     *      bash readline buffers the whole thing as one input chunk.
+     *   2. Chunk to 64 KB pieces and yield to the event loop between
+     *      sends, so a 2 MB paste doesn't tie up the renderer or hit the
+     *      server's per-frame ceiling.
+     * Hard-capped at PASTE_MAX (2 MB) — anything bigger gets truncated
+     * and we tell the user via an inline status line.
+     */
+    const PASTE_MAX = 2 * 1024 * 1024;
+    const PASTE_CHUNK = 64 * 1024;
+    async function pasteText(id, text) {
+      if (!text || ws.readyState !== WebSocket.OPEN) return;
+      let truncated = false;
+      if (text.length > PASTE_MAX) {
+        text = text.slice(0, PASTE_MAX);
+        truncated = true;
+      }
+      const wrapped = '\x1b[200~' + text + '\x1b[201~';
+      for (let i = 0; i < wrapped.length; i += PASTE_CHUNK) {
+        sendStdin(id, wrapped.slice(i, i + PASTE_CHUNK));
+        if (i + PASTE_CHUNK < wrapped.length) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      if (truncated) {
+        currentSession()?.writeStatus(
+          `\r\n\x1b[33m[paste truncated to ${(PASTE_MAX / 1024 / 1024) | 0}MB]\x1b[0m\r\n`,
+        );
+      }
+    }
+
+    /** Decode an incoming binary frame. Returns {tag, sessionId, payload}. */
+    function decodeFrame(buf) {
+      if (buf.length < 2) return null;
+      const tag = buf[0];
+      const sidLen = buf[1];
+      if (sidLen === 0 || buf.length < 2 + sidLen) return null;
+      const sessionId = dec.decode(buf.slice(2, 2 + sidLen));
+      const payload = buf.slice(2 + sidLen);
+      return { tag, sessionId, payload };
+    }
+
+    // ===== Tab + Session ==================================================
+    /**
+     * A Tab represents a session in the UI. Tabs come in two states:
+     *  - `dormant`: we know the tmux session exists (from session-list),
+     *               but no xterm instance and no PTY are attached on our
+     *               side. Cheap to keep around.
+     *  - `attached`: has an xterm pane + an open subscription on the WS.
+     *               Receives STDOUT frames, can send STDIN.
+     */
+    class Tab {
+      constructor(id) {
+        this.id = id;
+        this.session = null;          // Session | null
+        this.subscribed = false;      // server-side session-open ack-tracked
+        this.cwd = '';                // last-known pane_current_path
+        this.tabEl = document.createElement('div');
+        this.tabEl.className = 'tab dormant';
+        this.tabEl.dataset.id = id;
+        const title = document.createElement('span');
+        title.className = 'tab-title';
+        title.textContent = id;
+        const status = document.createElement('span');
+        status.className = 'tab-status';
+        const cwdEl = document.createElement('span');
+        cwdEl.className = 'tab-cwd';
+        this.tabEl.appendChild(title);
+        this.tabEl.appendChild(cwdEl);
+        this.tabEl.appendChild(status);
+        // Insert before the "+" button.
+        tabBar.insertBefore(this.tabEl, addBtn);
+      }
+
+      attach() {
+        if (!this.session) {
+          this.session = new Session(this.id, this);
+          this.tabEl.classList.remove('dormant');
+        }
+        if (!this.subscribed) {
+          sendCtrl({ type: 'session-open', id: this.id });
+          this.subscribed = true;
+        }
+      }
+
+      detachLocal(reason) {
+        // The server is telling us this session is gone, OR the user asked
+        // to close it. We dispose xterm and revert to dormant — but we
+        // KEEP the tab unless the underlying tmux session is gone.
+        if (this.session) {
+          this.session.destroy();
+          this.session = null;
+        }
+        this.subscribed = false;
+        this.tabEl.classList.add('dormant');
+        this.tabEl.classList.remove('has-activity');
+      }
+
+      setCwd(cwd) {
+        if (this.cwd === cwd) return;
+        this.cwd = cwd;
+        const cwdEl = this.tabEl.querySelector('.tab-cwd');
+        if (cwdEl) cwdEl.textContent = cwd ? cwd.replace(/^\/home\/[^/]+/, '~') : '';
+      }
+
+      remove() {
+        if (this.session) this.session.destroy();
+        this.tabEl.remove();
+      }
+
+      markActivity() {
+        if (activeId !== this.id) this.tabEl.classList.add('has-activity');
+      }
+
+      clearActivity() {
+        this.tabEl.classList.remove('has-activity');
+      }
+    }
+
+    /**
+     * A Session owns one xterm + addons, the DOM pane, and forwards
+     * input/output to the WS using its sessionId.
+     */
+    class Session {
+      constructor(id, tab) {
+        this.id = id;
+        this.tab = tab;
+        this.element = document.createElement('div');
+        this.element.className = 'pane';
+        this.element.dataset.id = id;
+        panes.appendChild(this.element);
+
+        this.term = new Terminal({
+          cursorBlink: true,
+          fontSize: loadFontSize(),
+          fontFamily: 'ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace',
+          theme: THEME,
+          scrollback: SCROLLBACK,
+          allowProposedApi: true,
+        });
+        this.fit = new FitAddon.FitAddon();
+        this.term.loadAddon(this.fit);
+        this.term.loadAddon(new WebLinksAddon.WebLinksAddon());
+        this.search = new SearchAddon.SearchAddon();
+        this.term.loadAddon(this.search);
+
+        this.term.open(this.element);
+        this.fit.fit();
+
+        // (Per-element contextmenu suppression removed — all contextmenu
+        // routing is handled by the single capture-phase listener at the
+        // bottom of this script.)
+
+        try {
+          const webgl = new WebglAddon.WebglAddon();
+          webgl.onContextLoss(() => webgl.dispose());
+          this.term.loadAddon(webgl);
+        } catch (e) {
+          console.warn(`[term ${id}] WebGL fallback:`, e?.message ?? e);
+        }
+
+        this.term.onData((data) => sendStdin(this.id, data));
+
+        // Intercept Ctrl/Cmd+Shift+A/C/V/F INSIDE xterm so the byte never
+        // reaches the shell. Without this, Ctrl+Shift+C would copy AND send
+        // ^C to the active process. attachCustomKeyEventHandler returning
+        // false short-circuits xterm's normal handling for that key event.
+        this.term.attachCustomKeyEventHandler((e) => {
+          if (e.type !== 'keydown') return true;
+          if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return true;
+          const k = (e.key || '').toLowerCase();
+          switch (k) {
+            case 'a':
+              this.term.selectAll();
+              e.preventDefault();
+              return false;
+            case 'c': {
+              const sel = this.term.getSelection();
+              if (sel) {
+                navigator.clipboard.writeText(sel).catch((err) => {
+                  this.writeStatus(`\r\n\x1b[31m[copy failed: ${err.message}]\x1b[0m\r\n`);
+                });
+              }
+              e.preventDefault();
+              return false;
+            }
+            case 'v':
+              navigator.clipboard.readText().then((txt) => {
+                if (txt) pasteText(this.id, txt);
+              }).catch((err) => {
+                this.writeStatus(`\r\n\x1b[31m[paste failed: ${err.message}]\x1b[0m\r\n`);
+              });
+              e.preventDefault();
+              return false;
+            case 'f':
+              openSearch();
+              e.preventDefault();
+              return false;
+            default:
+              return true;
+          }
+        });
+
+        this.resizeTimer = 0;
+        this.term.onResize(({ cols, rows }) => {
+          clearTimeout(this.resizeTimer);
+          this.resizeTimer = setTimeout(() => {
+            sendCtrl({ type: 'resize', sessionId: this.id, cols, rows });
+          }, 100);
+        });
+
+        this.term.write('\x1b[36m[connecting to ' + id + ']\x1b[0m\r\n');
+      }
+
+      onOpened() {
+        // Server confirmed session-open. Send our current size so the PTY
+        // matches the viewport from byte 1.
+        if (this.term.cols && this.term.rows) {
+          sendCtrl({ type: 'resize', sessionId: this.id, cols: this.term.cols, rows: this.term.rows });
+        }
+      }
+
+      write(bytes) {
+        this.term.write(bytes);
+        this.tab.markActivity();
+      }
+
+      writeStatus(text) {
+        this.term.write(text);
+      }
+
+      show() {
+        this.element.classList.add('active');
+        // re-fit because the pane was display:none until now
+        requestAnimationFrame(() => {
+          this.fit.fit();
+          this.term.focus();
+        });
+      }
+
+      hide() {
+        this.element.classList.remove('active');
+      }
+
+      destroy() {
+        try { this.term.dispose(); } catch {}
+        this.element.remove();
+      }
+    }
+
+    // ===== state ==========================================================
+    const tabs = new Map();           // id -> Tab
+    let activeId = null;
+    const tabBar = document.getElementById('tab-bar');
+    const panes = document.getElementById('panes');
+    const paneEmpty = document.getElementById('pane-empty');
+    const addBtn = document.getElementById('tab-add');
+    const helperBar = document.getElementById('helper-bar');
+
+    function ensureTab(id) {
+      let t = tabs.get(id);
+      if (!t) {
+        t = new Tab(id);
+        tabs.set(id, t);
+      }
+      return t;
+    }
+
+    function switchTo(id) {
+      const t = tabs.get(id);
+      if (!t) return;
+      if (activeId && activeId !== id) {
+        const prev = tabs.get(activeId);
+        if (prev?.session) prev.session.hide();
+        if (prev) prev.tabEl.classList.remove('active');
+      }
+      activeId = id;
+      localStorage.setItem(ACTIVE_KEY, id);
+      paneEmpty.style.display = 'none';
+      updateDocTitle();
+
+      t.tabEl.classList.add('active');
+      t.clearActivity();
+      // Center the active tab into view (mobile horizontal scroll).
+      t.tabEl.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+
+      if (!t.session) t.attach();
+      t.session.show();
+    }
+
+    function updateDocTitle() {
+      // Always just "terminalcat" — never include the active tab name.
+      // Browser tab/window titles get scraped by corporate EDR / DLP /
+      // browser-history sync. Tab names in this app are session names
+      // (could be a target host during bug-bounty work). Keep them off
+      // any external surface.
+      document.title = 'terminalcat';
+    }
+
+    /** Lowest unused `tabN` (n ≥ 1). Skips ids already in use. */
+    function nextTabName() {
+      for (let n = 1; n < 1000; n++) {
+        const id = `tab${n}`;
+        if (!tabs.has(id)) return id;
+      }
+      // Pathological — fall back to a timestamp-suffixed id.
+      return `tab-${Date.now()}`;
+    }
+
+    function removeTab(id) {
+      const t = tabs.get(id);
+      if (!t) return;
+      t.remove();
+      tabs.delete(id);
+      if (activeId === id) {
+        activeId = null;
+        // Switch to any remaining tab, or show empty state.
+        const next = tabs.keys().next();
+        if (!next.done) switchTo(next.value);
+        else { paneEmpty.style.display = 'flex'; paneEmpty.textContent = 'no sessions — tap + to create one'; }
+      }
+    }
+
+    // ===== WS event handling ==============================================
+    function wireWs(socket) {
+      socket.onopen = () => {
+        reconnectMs = 1000;
+        hideConnBanner();
+        paneEmpty.textContent = 'loading sessions…';
+        sendCtrl({ type: 'session-list' });
+        // Re-subscribe to any tabs that were attached before the disconnect.
+        // The session-list response handler also runs ensureTab+attach, but
+        // attach() short-circuits when t.subscribed already, so this just
+        // resurrects the server-side subscription cleanly.
+        for (const t of tabs.values()) {
+          if (t.session && !t.subscribed) {
+            sendCtrl({ type: 'session-open', id: t.id });
+            t.subscribed = true;
+            // Push the current viewport size so the PTY redraws to fit.
+            sendCtrl({ type: 'resize', sessionId: t.id, cols: t.session.term.cols, rows: t.session.term.rows });
+          }
+        }
+      };
+
+      socket.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          let msg;
+          try { msg = JSON.parse(ev.data); }
+          catch { console.warn('[ws] bad JSON:', ev.data); return; }
+          handleControl(msg);
+          return;
+        }
+        // Binary: data frame.
+        const f = decodeFrame(new Uint8Array(ev.data));
+        if (!f) { console.warn('[ws] malformed frame'); return; }
+        if (f.tag === 0x02) {                   // STDOUT
+          const t = tabs.get(f.sessionId);
+          if (t?.session) t.session.write(f.payload);
+        } else if (f.tag === 0x04) {            // FILE_DOWN_CHUNK
+          handleDownloadChunk(f.payload);
+        }
+      };
+
+      socket.onclose = (ev) => {
+        for (const t of tabs.values()) {
+          t.subscribed = false;
+          if (t.session) t.session.writeStatus('\r\n\x1b[33m[disconnected, reconnecting…]\x1b[0m\r\n');
+        }
+        scheduleReconnect();
+      };
+      socket.onerror = () => console.error('[ws] error event');
+    }
+
+    function handleControl(msg) {
+      switch (msg.type) {
+        case 'session-list': {
+          const list = Array.isArray(msg.sessions) ? msg.sessions : [];
+          if (list.length === 0) {
+            // Empty tmux server: seed with a single tab so the page isn't
+            // blank. We picked "tab0" instead of "default" so naming
+            // stays consistent with future "+ creates tab1, tab2".
+            ensureTab('tab0').attach();
+            switchTo('tab0');
+            return;
+          }
+          // Auto-attach EVERY tab from the list. Per user's "preserve all
+          // tabs and operations across browser close": dormant tabs would
+          // not accumulate output between switches, so we eagerly attach.
+          // Cost: one PTY child per tab. Single-tenant; acceptable.
+          for (const info of list) {
+            if (info && SESSION_ID_RE.test(info.id)) {
+              const t = ensureTab(info.id);
+              t.attach();
+            }
+          }
+          const wanted = localStorage.getItem(ACTIVE_KEY);
+          const target = (wanted && tabs.has(wanted)) ? wanted : list[0].id;
+          switchTo(target);
+          return;
+        }
+        case 'session-renamed': {
+          const { oldId, newId } = msg;
+          if (!oldId || !newId) return;
+          const t = tabs.get(oldId);
+          if (!t) return;
+          // Re-key the tabs map.
+          tabs.delete(oldId);
+          tabs.set(newId, t);
+          t.id = newId;
+          if (t.session) t.session.id = newId;
+          // Update the tab DOM.
+          t.tabEl.dataset.id = newId;
+          const titleEl = t.tabEl.querySelector('.tab-title');
+          if (titleEl) titleEl.textContent = newId;
+          if (activeId === oldId) {
+            activeId = newId;
+            localStorage.setItem(ACTIVE_KEY, newId);
+            updateDocTitle();
+          }
+          return;
+        }
+        case 'session-opened': {
+          const t = tabs.get(msg.id);
+          t?.session?.onOpened();
+          return;
+        }
+        case 'session-closed': {
+          const t = tabs.get(msg.id);
+          if (!t) return;
+          if (msg.reason === 'pty-exit') {
+            // Backend says this session is GONE. Remove the tab.
+            t.session?.writeStatus('\r\n\x1b[31m[session ended: ' + msg.reason + ']\x1b[0m\r\n');
+            // Give a beat to read it, then drop the tab.
+            setTimeout(() => removeTab(msg.id), 800);
+          } else {
+            // Just detached. Tab stays, becomes dormant.
+            t.detachLocal(msg.reason);
+          }
+          return;
+        }
+        case 'session-killed': {
+          // ack — the corresponding session-closed{reason:"pty-exit"} or
+          // similar will follow when our PTY child exits. Tab cleanup
+          // happens there.
+          return;
+        }
+        case 'error': {
+          console.error('[ctrl] server error:', msg);
+          // Visible to the user via active session if relevant.
+          const a = activeId && tabs.get(activeId);
+          a?.session?.writeStatus(`\r\n\x1b[31m[server error: ${msg.code}: ${msg.message}]\x1b[0m\r\n`);
+          return;
+        }
+        case 'session-cwd': {
+          const t = tabs.get(msg.id);
+          t?.setCwd(typeof msg.cwd === 'string' ? msg.cwd : '');
+          paintInfoBar();
+          return;
+        }
+        case 'connection-info': {
+          connInfo.ip = String(msg.ip ?? '?');
+          connInfo.email = String(msg.email ?? '?');
+          paintInfoBar();
+          return;
+        }
+        case 'session-clients': {
+          if (typeof msg.id === 'string' && Number.isInteger(msg.count)) {
+            sessionClients.set(msg.id, msg.count);
+            paintInfoBar();
+          }
+          return;
+        }
+        // ---- upload responses ----
+        case 'upload-ready':    onUploadReady(msg);    return;
+        case 'upload-rejected': onUploadRejected(msg); return;
+        case 'upload-progress': onUploadProgress(msg); return;
+        case 'upload-complete': onUploadComplete(msg); return;
+        case 'upload-failed':   onUploadFailed(msg);   return;
+        // ---- download (server-initiated by webdl) ----
+        case 'download-start':    onDownloadStart(msg);    return;
+        case 'download-progress': onDownloadProgress(msg); return;
+        case 'download-complete': onDownloadComplete(msg); return;
+        case 'download-failed':   onDownloadFailed(msg);   return;
+        // ---- notify (server-initiated by webnotify) ----
+        case 'notify':            onNotify(msg);           return;
+      }
+    }
+
+    // ===== tab interactions ==============================================
+    tabBar.addEventListener('click', (e) => {
+      const tab = e.target.closest('.tab');
+      if (tab) { switchTo(tab.dataset.id); return; }
+    });
+
+    // "+" creates a new tab with the next available `tabN` name. No
+    // prompt — fast path. Use double-click or the long-press menu to
+    // rename later.
+    addBtn.addEventListener('click', () => {
+      const id = nextTabName();
+      ensureTab(id);
+      switchTo(id);
+    });
+
+    // Double-click a tab to rename. The rename round-trips through the
+    // server (`session-rename`) and renames the tmux session itself —
+    // not just the displayed label.
+    tabBar.addEventListener('dblclick', (e) => {
+      const tabEl = e.target.closest('.tab');
+      if (!tabEl) return;
+      e.preventDefault();
+      const oldId = tabEl.dataset.id;
+      const raw = window.prompt(`Rename "${oldId}" to:`, oldId);
+      if (raw === null) return;
+      const newId = raw.trim();
+      if (!SESSION_ID_RE.test(newId)) {
+        alert('Invalid session id. Use [a-zA-Z0-9_-], 1–64 chars.');
+        return;
+      }
+      if (newId === oldId) return;
+      if (tabs.has(newId)) {
+        alert(`A tab named "${newId}" already exists.`);
+        return;
+      }
+      sendCtrl({ type: 'session-rename', id: oldId, newId });
+    });
+
+    // ===== long-press on tabs (rename/kill menu) =========================
+    let tabPressTimer = 0;
+    let tabPressId = '';
+
+    function startTabPress(id) {
+      clearTimeout(tabPressTimer);
+      tabPressId = id;
+      tabPressTimer = window.setTimeout(() => openTabMenu(id), 500);
+    }
+    function cancelTabPress() { clearTimeout(tabPressTimer); tabPressTimer = 0; }
+
+    tabBar.addEventListener('touchstart', (e) => {
+      const tab = e.target.closest('.tab');
+      if (tab) startTabPress(tab.dataset.id);
+    }, { passive: true });
+    tabBar.addEventListener('touchmove', cancelTabPress, { passive: true });
+    tabBar.addEventListener('touchend', cancelTabPress, { passive: true });
+    // (tab right-click is handled by the single capture-phase contextmenu
+    // listener near the bottom of this script.)
+
+    function openTabMenu(id) {
+      buildSheet([
+        { kind: 'header', text: `Session: ${id}` },
+        { kind: 'btn', label: 'Rename', action: () => {
+          const raw = window.prompt(`Rename "${id}" to:`, id);
+          if (raw === null) return;
+          const newId = raw.trim();
+          if (!SESSION_ID_RE.test(newId)) { alert('Invalid id'); return; }
+          if (newId === id) return;
+          if (tabs.has(newId)) { alert(`Tab "${newId}" exists`); return; }
+          sendCtrl({ type: 'session-rename', id, newId });
+        }},
+        { kind: 'btn', label: 'Detach (close tab, keep tmux)', action: () => {
+          sendCtrl({ type: 'session-close', id });
+        }},
+        { kind: 'btn', label: 'Kill (destroy session permanently)', danger: true, action: () => {
+          if (!confirm(`Kill session "${id}"? This will end any running processes inside.`)) return;
+          sendCtrl({ type: 'session-kill', id });
+        }},
+        { kind: 'btn', label: 'Cancel', action: () => {} },
+      ]);
+    }
+
+    // ===== terminal long-press (paste/copy/clear/detach) =================
+    function openTerminalMenu() {
+      const id = activeId;
+      if (!id) return;
+      buildSheet([
+        { kind: 'btn', label: 'Paste', action: async () => {
+          try {
+            const txt = await navigator.clipboard.readText();
+            if (txt) await pasteText(id, txt);
+          } catch (err) {
+            currentSession()?.writeStatus(`\r\n\x1b[31m[paste failed: ${err.message}]\x1b[0m\r\n`);
+          }
+        }},
+        { kind: 'btn', label: 'Copy selection', action: async () => {
+          const sel = currentSession()?.term.getSelection();
+          if (!sel) return;
+          try { await navigator.clipboard.writeText(sel); }
+          catch (err) {
+            currentSession()?.writeStatus(`\r\n\x1b[31m[copy failed: ${err.message}]\x1b[0m\r\n`);
+          }
+        }},
+        { kind: 'btn', label: 'Clear screen', action: () => {
+          sendStdin(id, '\x0c');     // Ctrl-L; shell redraws the prompt
+        }},
+        { kind: 'btn', label: 'Detach (close tab, keep tmux)', danger: true, action: () => {
+          sendCtrl({ type: 'session-close', id });
+        }},
+        { kind: 'btn', label: 'Cancel', action: () => {} },
+      ]);
+    }
+
+    function currentSession() {
+      const t = activeId ? tabs.get(activeId) : null;
+      return t?.session ?? null;
+    }
+
+    // ===== action sheet (shared) =========================================
+    const sheet = document.getElementById('action-sheet');
+    const overlay = document.getElementById('action-sheet-overlay');
+
+    function buildSheet(items) {
+      sheet.innerHTML = '';
+      for (const it of items) {
+        if (it.kind === 'header') {
+          const h = document.createElement('h3');
+          h.textContent = it.text;
+          sheet.appendChild(h);
+        } else {
+          const b = document.createElement('button');
+          b.textContent = it.label;
+          if (it.danger) b.classList.add('danger');
+          if (it.label === 'Cancel') b.dataset.action = 'cancel';
+          b.addEventListener('click', () => {
+            closeSheet();
+            try { it.action?.(); } catch (e) { console.error(e); }
+          });
+          sheet.appendChild(b);
+        }
+      }
+      openSheet();
+    }
+    function openSheet() {
+      sheet.classList.add('open');
+      overlay.classList.add('open');
+      sheet.setAttribute('aria-hidden', 'false');
+    }
+    function closeSheet() {
+      sheet.classList.remove('open');
+      overlay.classList.remove('open');
+      sheet.setAttribute('aria-hidden', 'true');
+    }
+    overlay.addEventListener('click', closeSheet);
+
+    // ===== terminal long-press detection on the panes ====================
+    let pressTimer = 0;
+    let pressStartX = 0, pressStartY = 0;
+    const LONG_PRESS_MS = 500;
+    const PRESS_MOVE_TOLERANCE = 10;
+
+    panes.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      pressStartX = e.touches[0].clientX;
+      pressStartY = e.touches[0].clientY;
+      clearTimeout(pressTimer);
+      pressTimer = window.setTimeout(() => {
+        openTerminalMenu();
+        if (navigator.vibrate) navigator.vibrate(8);
+      }, LONG_PRESS_MS);
+    }, { passive: true });
+    panes.addEventListener('touchmove', (e) => {
+      if (!pressTimer) return;
+      const t = e.touches[0];
+      if (Math.hypot(t.clientX - pressStartX, t.clientY - pressStartY) > PRESS_MOVE_TOLERANCE) {
+        clearTimeout(pressTimer);
+        pressTimer = 0;
+      }
+    }, { passive: true });
+    panes.addEventListener('touchend', () => {
+      clearTimeout(pressTimer);
+      pressTimer = 0;
+    }, { passive: true });
+    // (terminal right-click is handled by the single capture-phase
+    // contextmenu listener near the bottom of this script.)
+
+    // ===== pinch-to-zoom font ============================================
+    let pinchStart = 0, pinchStartFont = 0;
+    function pinchDistance(touches) {
+      const a = touches[0], b = touches[1];
+      return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    }
+    panes.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 2) {
+        pinchStart = pinchDistance(e.touches);
+        const cs = currentSession();
+        pinchStartFont = cs ? cs.term.options.fontSize : loadFontSize();
+        clearTimeout(pressTimer); pressTimer = 0;
+      }
+    }, { passive: true });
+    panes.addEventListener('touchmove', (e) => {
+      if (e.touches.length === 2 && pinchStart > 0) {
+        const ratio = pinchDistance(e.touches) / pinchStart;
+        const next = clamp(Math.round(pinchStartFont * ratio), FONT_MIN, FONT_MAX);
+        const cs = currentSession();
+        if (cs && next !== cs.term.options.fontSize) {
+          // Apply to ALL sessions so switching tabs doesn't surprise.
+          for (const t of tabs.values()) {
+            if (t.session) t.session.term.options.fontSize = next;
+          }
+          for (const t of tabs.values()) t.session?.fit.fit();
+          localStorage.setItem(FONT_KEY, String(next));
+        }
+      }
+    }, { passive: true });
+    panes.addEventListener('touchend', (e) => {
+      if (e.touches.length < 2) pinchStart = 0;
+    }, { passive: true });
+
+    // ===== helper bar (sticky modifiers) =================================
+    const sticky = { ctrl: false, alt: false };
+    function paintSticky() {
+      for (const el of helperBar.querySelectorAll('[data-mod]')) {
+        const mod = el.dataset.mod;
+        el.classList.toggle('sticky-on', !!sticky[mod]);
+      }
+    }
+    function consumeSticky() { sticky.ctrl = false; sticky.alt = false; paintSticky(); }
+
+    const KEY_BYTES = {
+      Escape: '\x1b',
+      Tab: '\t',
+      ArrowUp: '\x1b[A',
+      ArrowDown: '\x1b[B',
+      ArrowRight: '\x1b[C',
+      ArrowLeft: '\x1b[D',
+    };
+
+    function applyModsAndSend(payload) {
+      if (sticky.ctrl && payload.length === 1) {
+        const code = payload.toUpperCase().charCodeAt(0);
+        if (code >= 0x40 && code <= 0x5F) payload = String.fromCharCode(code - 0x40);
+      }
+      if (sticky.alt) payload = '\x1b' + payload;
+      consumeSticky();
+      if (activeId) sendStdin(activeId, payload);
+    }
+
+    helperBar.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.key-btn');
+      if (!btn) return;
+      ev.preventDefault();
+      if (btn.dataset.mod) {
+        sticky[btn.dataset.mod] = !sticky[btn.dataset.mod];
+        paintSticky();
+        return;
+      }
+      if (btn.dataset.combo === 'ctrl-a') {
+        if (activeId) sendStdin(activeId, '\x01'); consumeSticky(); return;
+      }
+      if (btn.dataset.combo === 'ctrl-c') {
+        if (activeId) sendStdin(activeId, '\x03'); consumeSticky(); return;
+      }
+      if (btn.dataset.combo === 'ctrl-d') {
+        if (activeId) sendStdin(activeId, '\x04'); consumeSticky(); return;
+      }
+      if (btn.dataset.key) {
+        applyModsAndSend(KEY_BYTES[btn.dataset.key] ?? btn.dataset.key);
+      }
+    });
+
+    // ===== visualViewport (iOS keyboard handling) ========================
+    // Strategy: when the on-screen keyboard appears, vv.height shrinks.
+    // We pin the body height to vv.height. The body is `display: flex;
+    // flex-direction: column`, so the helper bar (last flex child) stays
+    // at the bottom of the visible region — above the keyboard — without
+    // any `position: fixed` switching.
+    //
+    // Why not `position: fixed; bottom: keyboardHeight`: iOS Safari has
+    // a long-standing bug where `overflow-x: auto` on a fixed-positioned
+    // element refuses to scroll horizontally when the keyboard is up.
+    // Keeping the bar in normal flex flow sidesteps it entirely.
+    function applyViewport() {
+      const vv = window.visualViewport;
+      const cs = currentSession();
+      if (!vv) {
+        cs?.fit.fit();
+        return;
+      }
+      // Match body to the visible viewport so the bottom flex child
+      // (helper bar) sits right above the keyboard. Reset positioning
+      // overrides we may have set in earlier versions.
+      document.body.style.height = vv.height + 'px';
+      helperBar.style.position = '';
+      helperBar.style.left = '';
+      helperBar.style.right = '';
+      helperBar.style.bottom = '';
+      cs?.fit.fit();
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', applyViewport);
+      window.visualViewport.addEventListener('scroll', applyViewport);
+    }
+    window.addEventListener('resize', () => {
+      // Every tab needs a refit so it's ready when shown.
+      for (const t of tabs.values()) t.session?.fit.fit();
+      applyViewport();
+    });
+
+    // Keyboard shortcuts for select-all / copy / paste / search are
+    // handled inside each Session via attachCustomKeyEventHandler — see
+    // Session constructor. That path stops xterm from also forwarding
+    // the byte to the shell.
+
+    // ===== upload (drag-drop on desktop, file picker on mobile) ===========
+    // State machine:
+    //  user picks file(s) -> for each, call beginUpload(file)
+    //  beginUpload sends `upload-start`. Server replies `upload-ready` with
+    //  uploadId, or `upload-rejected`. On ready, we stream FILE_UP_CHUNK
+    //  binary frames (encoded with the file payload helper). Each chunk
+    //  includes uploadId + a 4-byte seq number so the server can assert
+    //  monotonicity (defense-in-depth — WS already preserves order).
+    // Pending uploads are keyed by a client-side temporary key (the File
+    // object reference) and re-keyed by uploadId once the server replies.
+    const UPLOAD_CHUNK = 64 * 1024;
+    const pendingByPath = new Map();    // path-string -> {file, sessionId, ...} (waiting for upload-ready)
+    const uploadsById   = new Map();    // uploadId -> {file, ..., card, seq, sent}
+
+    async function beginUpload(file, sessionId) {
+      if (!sessionId) return;
+      const reader = file.stream().getReader();
+      const stash = { file, sessionId, reader, card: addTransferCard(file.name, file.size, 'upload') };
+      pendingByPath.set(file.name + ':' + sessionId, stash);
+      sendCtrl({
+        type: 'upload-start',
+        sessionId,
+        name: file.name,
+        size: file.size,
+        mode: '0644',
+      });
+    }
+
+    async function streamUpload(stash, uploadId) {
+      let seq = 0;
+      let sent = 0;
+      try {
+        while (true) {
+          const { value, done } = await stash.reader.read();
+          if (done) break;
+          // value is Uint8Array; chunk further if larger than UPLOAD_CHUNK.
+          for (let off = 0; off < value.length; off += UPLOAD_CHUNK) {
+            const slice = value.subarray(off, Math.min(off + UPLOAD_CHUNK, value.length));
+            sendFileChunk(0x03, stash.sessionId, uploadId, seq, slice);
+            seq++;
+            sent += slice.length;
+            updateTransferCard(stash.card, sent, stash.file.size);
+            // Backpressure: if WS buffer is large, yield.
+            if (ws && ws.bufferedAmount > 4 * 1024 * 1024) {
+              await new Promise((r) => setTimeout(r, 30));
+            } else if ((seq & 31) === 0) {
+              await new Promise((r) => setTimeout(r, 0));
+            }
+          }
+        }
+      } catch (err) {
+        markTransferCard(stash.card, 'error', err.message);
+      }
+    }
+
+    function onUploadReady(msg) {
+      // Match the pending stash by file name = basename of msg.path. We
+      // don't have a client-issued correlation id (just upload-start's
+      // implicit ordering), so this heuristic is good enough for the
+      // single-tenant case. Server enforces 1 concurrent upload per
+      // session anyway, so collisions are rare.
+      const baseName = (msg.path || '').split('/').pop() || '';
+      let found = null;
+      for (const [k, v] of pendingByPath) {
+        if (v.file.name === baseName) { found = { k, v }; break; }
+      }
+      if (!found) return;
+      pendingByPath.delete(found.k);
+      uploadsById.set(msg.uploadId, found.v);
+      streamUpload(found.v, msg.uploadId);
+    }
+    function onUploadRejected(msg) {
+      // Find the most-recently-added pending (best heuristic without uploadId).
+      const last = Array.from(pendingByPath.entries()).pop();
+      if (!last) return;
+      pendingByPath.delete(last[0]);
+      markTransferCard(last[1].card, 'error', `${msg.code}: ${msg.message}`);
+    }
+    function onUploadProgress(msg) {
+      const stash = uploadsById.get(msg.uploadId);
+      if (!stash) return;
+      // server-side received bytes is authoritative; reflect it in the bar.
+      updateTransferCard(stash.card, msg.received, stash.file.size);
+    }
+    function onUploadComplete(msg) {
+      const stash = uploadsById.get(msg.uploadId);
+      if (!stash) return;
+      uploadsById.delete(msg.uploadId);
+      markTransferCard(stash.card, 'done', msg.path);
+    }
+    function onUploadFailed(msg) {
+      const stash = uploadsById.get(msg.uploadId);
+      if (!stash) return;
+      uploadsById.delete(msg.uploadId);
+      markTransferCard(stash.card, 'error', `${msg.code}: ${msg.message}`);
+    }
+
+    function sendFileChunk(tag, sessionId, transferId, seq, dataBytes) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const sidBytes = enc.encode(sessionId);
+      const idBytes = enc.encode(transferId);
+      const out = new Uint8Array(2 + sidBytes.length + 1 + idBytes.length + 4 + dataBytes.length);
+      let off = 0;
+      out[off++] = tag;
+      out[off++] = sidBytes.length;
+      out.set(sidBytes, off); off += sidBytes.length;
+      out[off++] = idBytes.length;
+      out.set(idBytes, off); off += idBytes.length;
+      // 4-byte big-endian seq
+      out[off++] = (seq >>> 24) & 0xff;
+      out[off++] = (seq >>> 16) & 0xff;
+      out[off++] = (seq >>> 8) & 0xff;
+      out[off++] = seq & 0xff;
+      out.set(dataBytes, off);
+      ws.send(out);
+    }
+
+    // ===== download =======================================================
+    // Pieces arrive as FILE_DOWN_CHUNK frames; we accumulate by downloadId
+    // into a list of Uint8Array chunks, then assemble a Blob on -complete
+    // and trigger a synthetic <a download> click.
+    const downloads = new Map();   // downloadId -> {name, size, chunks:[], received, expectedSeq, card}
+
+    function onDownloadStart(msg) {
+      downloads.set(msg.downloadId, {
+        name: msg.name,
+        size: msg.size,
+        chunks: [],
+        received: 0,
+        expectedSeq: 0,
+        card: addTransferCard(msg.name, msg.size, 'download'),
+      });
+    }
+    function handleDownloadChunk(payload) {
+      // payload: [idLen][id][seq:4][bytes]
+      if (payload.length < 5) return;
+      const idLen = payload[0];
+      if (payload.length < 1 + idLen + 4) return;
+      const id = dec.decode(payload.slice(1, 1 + idLen));
+      const seq = (payload[1 + idLen] << 24) |
+                  (payload[2 + idLen] << 16) |
+                  (payload[3 + idLen] << 8)  |
+                  (payload[4 + idLen]);
+      const data = payload.slice(1 + idLen + 4);
+      const d = downloads.get(id);
+      if (!d) return;
+      if (seq !== d.expectedSeq) {
+        markTransferCard(d.card, 'error', `out-of-order chunk (got ${seq}, want ${d.expectedSeq})`);
+        downloads.delete(id);
+        return;
+      }
+      d.expectedSeq++;
+      d.chunks.push(data);
+      d.received += data.length;
+      updateTransferCard(d.card, d.received, d.size);
+    }
+    function onDownloadProgress(msg) {
+      const d = downloads.get(msg.downloadId);
+      if (!d) return;
+      // Could update with server-side `sent`; usually our local count is fine.
+    }
+    function onDownloadComplete(msg) {
+      const d = downloads.get(msg.downloadId);
+      if (!d) return;
+      downloads.delete(msg.downloadId);
+      const blob = new Blob(d.chunks);
+      const url = URL.createObjectURL(blob);
+      // Synthetic click triggers the browser's download flow. On iOS this
+      // hands off to the Files app's "Save to Files" prompt.
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = d.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Free memory after a beat.
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      markTransferCard(d.card, 'done', d.name);
+    }
+    function onDownloadFailed(msg) {
+      const d = downloads.get(msg.downloadId);
+      if (d) {
+        downloads.delete(msg.downloadId);
+        markTransferCard(d.card, 'error', `${msg.code}: ${msg.message}`);
+      }
+    }
+
+    // ===== transfer card UI ==============================================
+    const transfers = document.getElementById('transfers');
+    function addTransferCard(name, size, kind) {
+      const card = document.createElement('div');
+      card.className = 'transfer';
+      const arrow = kind === 'upload' ? '↑' : '↓';
+      card.innerHTML =
+        '<div class="transfer-name"><span>' + arrow + ' ' + escapeHtml(name) + '</span><span class="pct">0%</span></div>' +
+        '<div class="transfer-bar"><div class="transfer-bar-fill"></div></div>';
+      card._size = size;
+      transfers.appendChild(card);
+      return card;
+    }
+    function updateTransferCard(card, sent, total) {
+      if (!card) return;
+      const pct = total ? Math.min(100, Math.round((sent / total) * 100)) : 0;
+      const fill = card.querySelector('.transfer-bar-fill');
+      const lbl = card.querySelector('.pct');
+      if (fill) fill.style.width = pct + '%';
+      if (lbl) lbl.textContent = pct + '%';
+    }
+    function markTransferCard(card, status, info) {
+      if (!card) return;
+      card.classList.add(status);
+      const lbl = card.querySelector('.pct');
+      if (lbl) lbl.textContent = status === 'done' ? 'done' : 'failed';
+      if (status === 'error') {
+        const err = document.createElement('div');
+        err.style.color = '#f7768e';
+        err.style.fontSize = '11px';
+        err.style.marginTop = '4px';
+        err.textContent = info ?? '';
+        card.appendChild(err);
+      }
+      // Auto-dismiss after 6s.
+      setTimeout(() => { try { card.remove(); } catch {} }, 6000);
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;',
+      }[c]));
+    }
+
+    // ===== drag-and-drop on the panes (desktop) =========================
+    panes.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer?.types?.includes('Files')) return;
+      e.preventDefault();
+      panes.classList.add('drag-over');
+    });
+    panes.addEventListener('dragleave', () => panes.classList.remove('drag-over'));
+    panes.addEventListener('drop', (e) => {
+      e.preventDefault();
+      panes.classList.remove('drag-over');
+      if (!activeId) return;
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      for (const f of files) beginUpload(f, activeId);
+    });
+
+    // ===== upload button (mobile picker) =================================
+    const fileInput = document.getElementById('file-input');
+    document.getElementById('btn-upload').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      if (!activeId) return;
+      const files = Array.from(fileInput.files ?? []);
+      for (const f of files) beginUpload(f, activeId);
+      fileInput.value = '';
+    });
+
+    // ===== search bar =====================================================
+    const searchBar   = document.getElementById('search-bar');
+    const searchInput = document.getElementById('search-input');
+    function openSearch() {
+      const cs = currentSession();
+      if (!cs) return;
+      searchBar.classList.add('show');
+      setTimeout(() => searchInput.focus(), 50);
+    }
+    function closeSearch() {
+      searchBar.classList.remove('show');
+      const cs = currentSession();
+      cs?.search?.clearDecorations?.();
+      cs?.term.focus();
+    }
+    function searchFind(reverse) {
+      const cs = currentSession();
+      const q = searchInput.value;
+      if (!cs || !q) return;
+      if (reverse) cs.search.findPrevious(q);
+      else cs.search.findNext(q);
+    }
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { searchFind(e.shiftKey); e.preventDefault(); }
+      else if (e.key === 'Escape') { closeSearch(); e.preventDefault(); }
+    });
+    document.getElementById('search-prev').addEventListener('click', () => searchFind(true));
+    document.getElementById('search-next').addEventListener('click', () => searchFind(false));
+    document.getElementById('search-close').addEventListener('click', closeSearch);
+    document.getElementById('btn-search').addEventListener('click', () => {
+      if (searchBar.classList.contains('show')) closeSearch();
+      else openSearch();
+    });
+
+    // ===== per-tab cwd polling ===========================================
+    // Polls the active tab every 3s. Cheap (one tmux subprocess each), and
+    // only the active tab — others stay on whatever they last had.
+    setInterval(() => {
+      if (!activeId) return;
+      const t = tabs.get(activeId);
+      if (!t?.subscribed) return;
+      sendCtrl({ type: 'session-cwd', id: activeId });
+    }, 3000);
+
+    // ===== notify handler (webnotify shim) ==============================
+    function onNotify(msg) {
+      const text = String(msg.message ?? '').slice(0, 256);
+      // 1) Inline status into the originating session's terminal so it's
+      //    visible if the tab is open.
+      const t = tabs.get(msg.sessionId);
+      t?.session?.writeStatus(`\r\n\x1b[36m[notify] ${text}\x1b[0m\r\n`);
+      t?.markActivity();
+      // 2) Browser notification if the page is hidden / backgrounded
+      //    AND the user has granted permission.
+      if (document.visibilityState !== 'visible' && Notification?.permission === 'granted') {
+        try {
+          const n = new Notification('terminalcat: ' + msg.sessionId, { body: text, icon: 'icon.svg' });
+          n.onclick = () => window.focus();
+        } catch { /* */ }
+      }
+    }
+    // Lazily ask for notification permission when the user opens the
+    // snippets / settings drawer (any deliberate interaction). Avoid
+    // auto-prompting on page load — that's annoying.
+    function maybeAskNotificationPerm() {
+      if (!('Notification' in window)) return;
+      if (Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+    }
+
+    // ===== snippets drawer ===============================================
+    const SNIPPETS_KEY = 'tc.snippets';
+    function loadSnippets() {
+      try { return JSON.parse(localStorage.getItem(SNIPPETS_KEY) ?? '[]'); }
+      catch { return []; }
+    }
+    function saveSnippets(list) {
+      localStorage.setItem(SNIPPETS_KEY, JSON.stringify(list));
+    }
+    function openSnippets() {
+      maybeAskNotificationPerm();
+      const list = loadSnippets();
+      const items = [{ kind: 'header', text: 'Snippets' }];
+      list.forEach((s, i) => {
+        items.push({ kind: 'btn', label: s.label || s.cmd, action: () => {
+          if (activeId) sendStdin(activeId, s.cmd + (s.cmd.endsWith('\n') ? '' : '\r'));
+        }});
+        // Long-label could be added later; for v1 keep simple.
+      });
+      items.push({ kind: 'btn', label: '＋ Add snippet', action: addSnippet });
+      if (list.length > 0) items.push({ kind: 'btn', label: '✕ Clear all', danger: true, action: () => {
+        if (confirm('Clear all snippets?')) { saveSnippets([]); }
+      }});
+      items.push({ kind: 'btn', label: 'Cancel', action: () => {} });
+      buildSheet(items);
+    }
+    function addSnippet() {
+      const cmd = window.prompt('Snippet command (e.g. `nuclei -l alive.txt`):');
+      if (!cmd) return;
+      const label = window.prompt('Short label (optional):', cmd.length > 30 ? cmd.slice(0, 30) + '…' : cmd) ?? cmd;
+      const list = loadSnippets();
+      list.push({ label, cmd });
+      saveSnippets(list);
+    }
+    document.getElementById('btn-snippets').addEventListener('click', openSnippets);
+
+    // ===== service worker (PWA) ==========================================
+    // Minimal pass-through SW: registered to qualify as a PWA on Lighthouse
+    // and to enable "Add to Home Screen" prompts on Android/Chrome. NO
+    // caching — would break our auth flow and stale-cache the SPA. The SW
+    // exists purely to satisfy the PWA criterion. (Per spec: "Service
+    // worker NOT required for v1 — actively avoid stale-cache". This SW
+    // is a no-op, so the spec spirit is preserved.)
+    if ('serviceWorker' in navigator && location.protocol === 'https:') {
+      navigator.serviceWorker.register('sw.js').catch((err) => {
+        console.warn('[pwa] sw register failed:', err.message);
+      });
+    }
+
+    // ===== right-click context menu (small, Windows-style) ==============
+    // Long-press on mobile still uses the bottom sheet (buildSheet) —
+    // bigger touch targets are easier on a phone. This is the desktop
+    // sibling: small box at the cursor, tight items.
+    const ctxMenuEl = document.getElementById('ctx-menu');
+    function openContextMenu(items, x, y) {
+      ctxMenuEl.innerHTML = '';
+      for (const it of items) {
+        if (it.kind === 'sep') {
+          const sep = document.createElement('div');
+          sep.className = 'ctx-sep';
+          ctxMenuEl.appendChild(sep);
+        } else {
+          const b = document.createElement('button');
+          b.type = 'button';
+          if (it.danger) b.classList.add('danger');
+          if (it.disabled) b.disabled = true;
+          // Use innerHTML so we can show a right-aligned shortcut hint.
+          b.innerHTML = escapeHtml(it.label) +
+            (it.shortcut ? `<span class="ctx-shortcut">${escapeHtml(it.shortcut)}</span>` : '');
+          if (!it.disabled) {
+            b.addEventListener('click', () => {
+              closeContextMenu();
+              try { it.action?.(); } catch (err) { console.error(err); }
+            });
+          }
+          ctxMenuEl.appendChild(b);
+        }
+      }
+      ctxMenuEl.style.left = x + 'px';
+      ctxMenuEl.style.top = y + 'px';
+      ctxMenuEl.classList.add('show');
+      ctxMenuEl.setAttribute('aria-hidden', 'false');
+      // Reposition if the menu would clip off-screen.
+      requestAnimationFrame(() => {
+        const r = ctxMenuEl.getBoundingClientRect();
+        if (r.right > window.innerWidth - 4) {
+          ctxMenuEl.style.left = Math.max(4, window.innerWidth - r.width - 4) + 'px';
+        }
+        if (r.bottom > window.innerHeight - 4) {
+          ctxMenuEl.style.top = Math.max(4, window.innerHeight - r.height - 4) + 'px';
+        }
+      });
+    }
+    function closeContextMenu() {
+      ctxMenuEl.classList.remove('show');
+      ctxMenuEl.setAttribute('aria-hidden', 'true');
+    }
+    // Close on outside click and Escape.
+    window.addEventListener('mousedown', (e) => {
+      if (!e.target.closest('#ctx-menu')) closeContextMenu();
+    });
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeContextMenu();
+    });
+    window.addEventListener('blur', closeContextMenu);
+
+    // SINGLE source of truth for right-click. Capture phase + always
+    // preventDefault + stopImmediatePropagation. This:
+    //   - blocks Chrome's native textarea context menu on xterm.js's
+    //     hidden `.xterm-helper-textarea` (the "Cut/Paste/Spellcheck/
+    //     Zoom/Inspect" one that was stacking on top of our menu)
+    //   - blocks the page-level browser menu everywhere else
+    //   - prevents any leftover element-level contextmenu listeners
+    //     from also firing (stopImmediatePropagation)
+    // Then routes to our own context menu based on what was clicked.
+    // window.prompt() boxes are out-of-document browser dialogs, so this
+    // doesn't affect typing/right-click paste inside them.
+    document.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+
+      const tab = e.target.closest('.tab');
+      if (tab && tab.dataset.id) {
+        openTabContext(tab.dataset.id, e.clientX, e.clientY);
+        return;
+      }
+      if (e.target.closest('#panes') && activeId) {
+        openTerminalContext(e.clientX, e.clientY);
+        return;
+      }
+      // Any other area: just suppress the native menu, no custom one shown.
+    }, true);
+
+    // Items shared between desktop ctx-menu and mobile action-sheet.
+    function terminalActions() {
+      const id = activeId;
+      const cs = currentSession();
+      const hasSel = !!cs?.term.getSelection();
+      return [
+        { label: 'Copy',          shortcut: 'Ctrl+Shift+C', disabled: !hasSel, action: async () => {
+            const sel = cs?.term.getSelection();
+            if (sel) await navigator.clipboard.writeText(sel).catch(() => {});
+        }},
+        { label: 'Paste',         shortcut: 'Ctrl+Shift+V', action: async () => {
+            try {
+              const txt = await navigator.clipboard.readText();
+              if (txt && id) await pasteText(id, txt);
+            } catch (err) {
+              currentSession()?.writeStatus(`\r\n\x1b[31m[paste failed: ${err.message}]\x1b[0m\r\n`);
+            }
+        }},
+        { label: 'Select all',    shortcut: 'Ctrl+Shift+A', action: () => cs?.term.selectAll() },
+        { kind: 'sep' },
+        { label: 'Search...',     shortcut: 'Ctrl+Shift+F', action: openSearch },
+        { label: 'Clear screen', action: () => {
+          // Belt-and-suspenders: clear xterm's in-browser buffer AND tell
+          // the shell to redraw via Ctrl-L. With only the latter, bash
+          // does a clear+redraw but xterm's scrollback in the browser
+          // still has the old content above. With only the former,
+          // bash's idea of the cursor row is wrong on some prompts.
+          const cs = currentSession();
+          cs?.term.clear();
+          if (id) sendStdin(id, '\x0c');
+        }},
+        { kind: 'sep' },
+        { label: 'Detach session', danger: true, action: () => { if (id) sendCtrl({ type: 'session-close', id }); } },
+      ];
+    }
+
+    function openTerminalContext(x, y) {
+      if (!activeId) return;
+      openContextMenu(terminalActions(), x, y);
+    }
+
+    function tabActions(id) {
+      return [
+        { label: `Session: ${id}`, disabled: true },
+        { kind: 'sep' },
+        { label: 'Rename...',  action: () => {
+          const raw = window.prompt(`Rename "${id}" to:`, id);
+          if (raw === null) return;
+          const newId = raw.trim();
+          if (!SESSION_ID_RE.test(newId)) { alert('Invalid id'); return; }
+          if (newId === id) return;
+          if (tabs.has(newId)) { alert(`Tab "${newId}" exists`); return; }
+          sendCtrl({ type: 'session-rename', id, newId });
+        }},
+        { label: 'Detach',     action: () => sendCtrl({ type: 'session-close', id }) },
+        { label: 'Kill...',    danger: true, action: () => {
+          if (!confirm(`Kill session "${id}"? This will end any running processes inside.`)) return;
+          sendCtrl({ type: 'session-kill', id });
+        }},
+      ];
+    }
+    function openTabContext(id, x, y) {
+      openContextMenu(tabActions(id), x, y);
+    }
+
+    // Replace the old mobile bottom-sheet implementations of these so
+    // both the right-click menu and the long-press sheet use the same
+    // action set. (Long-press handlers reference openTerminalMenu /
+    // openTabMenu — keep those names as wrappers around the actions.)
+    function openTerminalMenu() {
+      buildSheet([
+        ...terminalActions().map((it) => it.kind === 'sep'
+          ? it
+          : { kind: 'btn', label: it.label, danger: it.danger, action: it.action }),
+        { kind: 'btn', label: 'Cancel', action: () => {} },
+      ]);
+    }
+    function openTabMenu(id) {
+      buildSheet([
+        ...tabActions(id).map((it) => it.kind === 'sep'
+          ? it
+          : { kind: it.disabled ? 'header' : 'btn', text: it.label, label: it.label, danger: it.danger, action: it.action }),
+        { kind: 'btn', label: 'Cancel', action: () => {} },
+      ]);
+    }
+
+    // ===== tmux mouse toggle (helper bar 🖱) ============================
+    // Default: ON  (scroll wheel scrolls tmux's scrollback, mouse selection
+    //               requires Shift+click+drag — xterm.js convention).
+    // OFF:           xterm.js owns the mouse — selection works without
+    //               Shift, but scroll wheel sends ↑/↓ to the inner shell.
+    const TMUX_MOUSE_KEY = 'tc.tmuxMouse';
+    let tmuxMouseOn = (localStorage.getItem(TMUX_MOUSE_KEY) ?? 'on') !== 'off';
+    function paintMouseBtn() {
+      const btn = document.getElementById('btn-mouse');
+      if (!btn) return;
+      btn.classList.toggle('sticky-on', tmuxMouseOn);
+      btn.title = tmuxMouseOn
+        ? 'Tmux mouse: ON  (scroll = scrollback, Shift+click to select). Tap to switch.'
+        : 'Tmux mouse: OFF (native selection, scroll = ↑/↓ history). Tap to switch.';
+    }
+    paintMouseBtn();
+    document.getElementById('btn-mouse').addEventListener('click', () => {
+      tmuxMouseOn = !tmuxMouseOn;
+      localStorage.setItem(TMUX_MOUSE_KEY, tmuxMouseOn ? 'on' : 'off');
+      sendCtrl({ type: 'tmux-mouse', on: tmuxMouseOn });
+      paintMouseBtn();
+    });
+    // On reconnect / first connect, push the persisted preference to the
+    // server so it doesn't reset to the default every page load.
+    const _origConnect = connect;
+
+    // ===== detached bar (chips) =========================================
+    // Each chip is two regions: clickable-text (reattach) and an × (kill,
+    // with confirm). Hidden tabs (CSS .tab.dormant{display:none}) are
+    // surfaced here so they don't disappear from the UI.
+    const detachedBar = document.getElementById('detached-bar');
+    function paintDetachedBar() {
+      detachedBar.innerHTML = '';
+      const dormantIds = [];
+      for (const t of tabs.values()) {
+        if (!t.session) dormantIds.push(t.id);
+      }
+      if (dormantIds.length === 0) return;
+
+      const label = document.createElement('span');
+      label.className = 'det-label';
+      label.textContent = 'Detached:';
+      detachedBar.appendChild(label);
+
+      for (const id of dormantIds) {
+        const chip = document.createElement('div');
+        chip.className = 'det-chip';
+
+        const attach = document.createElement('span');
+        attach.className = 'det-attach';
+        attach.textContent = id;
+        attach.title = `Reattach session "${id}"`;
+        attach.addEventListener('click', () => switchTo(id));
+
+        const kill = document.createElement('button');
+        kill.className = 'det-kill';
+        kill.type = 'button';
+        kill.textContent = '×';
+        kill.title = `Kill session "${id}"`;
+        kill.setAttribute('aria-label', `Kill ${id}`);
+        kill.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (!confirm(`Kill session "${id}"? This destroys it permanently.`)) return;
+          sendCtrl({ type: 'session-kill', id });
+        });
+
+        chip.appendChild(attach);
+        chip.appendChild(kill);
+        detachedBar.appendChild(chip);
+      }
+    }
+
+    // ===== info bar ======================================================
+    // Replaces tmux's status bar. Shows: client count, active session,
+    // active cwd, our origin IP (the Cf-Connecting-Ip the server saw).
+    const infoBar = document.getElementById('info-bar');
+    const connInfo = { ip: '?', email: '?' };
+    const sessionClients = new Map();   // sessionId -> count
+
+    function paintInfoBar() {
+      infoBar.innerHTML = '';
+      const id = activeId;
+      const t = id ? tabs.get(id) : null;
+      const cwd = t?.cwd ? t.cwd.replace(/^\/home\/[^/]+/, '~') : '';
+      // If we don't yet have a server-pushed count, show "1" if a session
+      // is attached on our end (we know we're at least a subscriber).
+      const count = (id && sessionClients.has(id))
+        ? sessionClients.get(id)
+        : (t?.session ? 1 : 0);
+
+      function pill(icon, text, options) {
+        const p = document.createElement('span');
+        p.className = 'info-pill' + (options?.muted ? ' muted' : '');
+        if (options?.title) p.title = options.title;
+        const ic = document.createElement('span');
+        ic.className = 'icon';
+        ic.textContent = icon;
+        const tx = document.createElement('span');
+        tx.textContent = text;
+        p.appendChild(ic);
+        p.appendChild(tx);
+        infoBar.appendChild(p);
+      }
+
+      pill('●', count + (count === 1 ? ' device' : ' devices'),
+        { title: 'WebSocket subscribers attached to this session' });
+      pill('▸', id || 'no session');
+      if (cwd) pill('🗀', cwd, { muted: true });
+      pill('⌂', connInfo.ip, { muted: true, title: `you (${connInfo.email})` });
+    }
+
+    // Hook the painters into existing flow without touching every call site.
+    // Wrap switchTo, removeTab. Tab.attach/detachLocal already mutate state;
+    // we monkey-patch their prototypes to call the painters after.
+    const _origSwitchTo = switchTo;
+    switchTo = function (id) {
+      _origSwitchTo(id);
+      paintDetachedBar();
+      paintInfoBar();
+    };
+    const _origRemoveTab = removeTab;
+    removeTab = function (id) {
+      _origRemoveTab(id);
+      paintDetachedBar();
+      paintInfoBar();
+    };
+    const _origAttach = Tab.prototype.attach;
+    Tab.prototype.attach = function () {
+      _origAttach.call(this);
+      paintDetachedBar();
+      paintInfoBar();
+    };
+    const _origDetachLocal = Tab.prototype.detachLocal;
+    Tab.prototype.detachLocal = function (reason) {
+      _origDetachLocal.call(this, reason);
+      // If the active tab just became dormant, switch to any other
+      // attached one — otherwise the pane area goes blank.
+      if (activeId === this.id) {
+        const next = Array.from(tabs.values()).find((t) => t !== this && t.session);
+        if (next) {
+          switchTo(next.id);
+        } else {
+          activeId = null;
+          paneEmpty.style.display = 'flex';
+          paneEmpty.textContent = 'no active sessions — pick one from the bar below or tap +';
+          updateDocTitle();
+        }
+      }
+      paintDetachedBar();
+      paintInfoBar();
+    };
+
+    // ===== boot the WS ====================================================
+    connect();
+    paintInfoBar();   // initial render with placeholders
+    // Apply the persisted mouse state right after the WS opens. We call
+    // this in `wireWs.onopen` indirectly via a pending list — simplest:
+    // push it 200ms after first open.
+    setTimeout(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        sendCtrl({ type: 'tmux-mouse', on: tmuxMouseOn });
+      }
+    }, 250);
+  </script>
+</body>
+</html>

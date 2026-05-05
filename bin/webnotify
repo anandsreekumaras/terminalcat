@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// webnotify <message> — push a desktop / mobile notification to whoever
+// is currently attached to your tmux session in the browser.
+//
+// Run after a long command:
+//   nuclei -l … -o out.txt; webnotify "nuclei done"
+
+'use strict';
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+function die(msg, code = 1) {
+  process.stderr.write(`webnotify: ${msg}\n`);
+  process.exit(code);
+}
+
+if (!process.env.TMUX) die('not inside tmux ($TMUX unset).');
+if (process.argv.length < 3) die(`usage: ${path.basename(process.argv[1])} <message>`);
+
+const message = process.argv.slice(2).join(' ').slice(0, 1024);
+
+let session;
+try {
+  session = execFileSync('tmux', ['display-message', '-p', '#{session_name}'], { encoding: 'utf8' }).trim();
+} catch (e) {
+  die(`tmux display-message failed: ${e.message}`);
+}
+if (!session) die("couldn't determine tmux session name");
+
+const xdg = process.env.XDG_RUNTIME_DIR;
+const sockPath = (xdg && fs.existsSync(xdg))
+  ? path.join(xdg, 'terminalcat.sock')
+  : `/tmp/terminalcat-${process.getuid ? process.getuid() : 0}.sock`;
+
+if (!fs.existsSync(sockPath)) die(`server socket not found at ${sockPath}`);
+
+const conn = net.connect(sockPath);
+let buf = '';
+conn.on('connect', () => {
+  conn.write(JSON.stringify({ action: 'notify', sessionId: session, message }) + '\n');
+});
+conn.on('data', (d) => { buf += d.toString('utf8'); });
+conn.on('end', () => {
+  const line = buf.split('\n').find((s) => s.trim().length > 0) || '';
+  let reply;
+  try { reply = JSON.parse(line); } catch { reply = null; }
+  if (!reply) die('no reply from server');
+  if (reply.ok) process.exit(0);
+  die(reply.error || 'unknown error');
+});
+conn.on('error', (e) => die(`socket: ${e.message}`));

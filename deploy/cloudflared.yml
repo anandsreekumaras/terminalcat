@@ -1,0 +1,44 @@
+# cloudflared tunnel config for terminalcat.
+#
+# This is the CLI-managed pattern (credentials file on disk). Replace
+# `tunnel` and `credentials-file` with YOUR tunnel's UUID; you can also
+# delete this file entirely and use a dashboard-managed tunnel via
+# `cloudflared tunnel run --token <TOKEN>` (in which case the public
+# hostname routing is configured in the CF Zero Trust dashboard, not
+# here).
+#
+# Suggested install (CLI-managed path):
+#   1. cloudflared login                                   # one-time
+#   2. cloudflared tunnel create terminalcat               # gets UUID + creds
+#   3. (edit this file: paste the UUID and creds path)
+#   4. cloudflared tunnel route dns terminalcat shell.example.com
+#   5. cloudflared tunnel --config deploy/cloudflared.yml run
+#
+# To run as a systemd service (preferred for prod):
+#   sudo cloudflared service install
+#   # then move/symlink THIS yaml to /etc/cloudflared/config.yml
+#
+# WebSocket upgrades pass through Cloudflare Tunnel by default — no
+# extra ingress flags needed. The Access SSO gate is configured in the
+# Zero Trust dashboard against `shell.example.com`, NOT here.
+
+tunnel: REPLACE-WITH-YOUR-TUNNEL-UUID
+credentials-file: /home/ubuntu/.cloudflared/REPLACE-WITH-YOUR-TUNNEL-UUID.json
+
+# Optional: prometheus-style metrics on a local-only port. Comment out
+# in environments where another cloudflared is already on the default.
+# metrics: 127.0.0.1:20245
+
+ingress:
+  - hostname: shell.example.com
+    service: http://127.0.0.1:7682
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 10s
+      tcpKeepAlive: 30s
+      keepAliveTimeout: 5m
+      keepAliveConnections: 8
+
+  # Catch-all: anything else this tunnel receives gets a 404. Required by
+  # cloudflared — the last entry must be a service-only rule.
+  - service: http_status:404
