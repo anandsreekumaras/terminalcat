@@ -149,6 +149,43 @@ export function keepTmuxSelectionAfterDrag(): Promise<void> {
 }
 
 /**
+ * Bridge tmux's selection to the BROWSER clipboard via OSC 52.
+ *
+ * Without this, `copy-selection-no-clear` (set in keepTmuxSelectionAfter
+ * Drag) copies the selection only into tmux's INTERNAL buffer — useful
+ * inside tmux (`Ctrl-b ]` to paste) but invisible to the rest of the OS.
+ * Users dragging text expect Cmd-V / Ctrl-V to paste it ANYWHERE.
+ *
+ * The OSC 52 path:
+ *   1. `set-clipboard on` tells tmux to emit `ESC ] 52 ; c ; <base64> BEL`
+ *      whenever a copy action runs.
+ *   2. terminal-overrides `Ms=…` tells tmux that the outer terminal
+ *      (xterm.js, which we report as xterm-256color via node-pty's `name`)
+ *      can handle that escape — terminfo's `Ms` capability sometimes
+ *      isn't set on the host's xterm-256color entry, so we override.
+ *   3. xterm.js receives the escape and a JS handler in
+ *      public/index.html (registered per-Session) decodes the base64
+ *      and calls `navigator.clipboard.writeText`. Only works in a
+ *      user-gesture context — the mouse-drag-end IS one.
+ */
+export function enableTmuxClipboard(): Promise<void> {
+  const cmds: string[][] = [
+    ['set-option', '-g', 'set-clipboard', 'on'],
+    [
+      'set-option', '-ga', 'terminal-overrides',
+      ',xterm-256color:Ms=\\E]52;c;%p2%s\\E\\\\,tmux-256color:Ms=\\E]52;c;%p2%s\\E\\\\',
+    ],
+  ];
+  return Promise.all(cmds.map((args) => new Promise<void>((resolve) => {
+    const c = spawn('tmux', args);
+    c.on('error', () => resolve());
+    c.on('close', () => resolve());
+  }))).then(() => {
+    console.log('[tmux] set-clipboard on (OSC 52 -> browser clipboard)');
+  });
+}
+
+/**
  * Hide tmux's built-in green status bar — terminalcat replaces it with
  * its own #info-bar that knows the WS client count and source IP, which
  * tmux can't see. Idempotent.

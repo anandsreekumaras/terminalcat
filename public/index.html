@@ -871,6 +871,42 @@
         // routing is handled by the single capture-phase listener at the
         // bottom of this script.)
 
+        // OSC 52 → browser clipboard.
+        //
+        // tmux is configured (server-side `set-clipboard on`) to emit
+        // `ESC ] 52 ; c ; <base64> BEL` whenever a copy action runs in
+        // copy-mode. xterm.js's parser hands those payloads to this
+        // OSC handler. We decode the base64 and shove it into the
+        // browser's clipboard via the modern Promise-based API. Without
+        // this, drag-select copy lands only in tmux's internal buffer —
+        // pasteable inside tmux but not in any other window.
+        //
+        // Returning `true` tells xterm.js we handled the escape so it
+        // doesn't try its own (deprecated execCommand) fallback.
+        this.term.parser.registerOscHandler(52, (data) => {
+          // payload format: "<targets>;<base64>" — targets is e.g. 'c'
+          // for clipboard, 'p' for primary selection. We honour any.
+          const semi = data.indexOf(';');
+          if (semi < 0) return false;
+          const b64 = data.slice(semi + 1);
+          // "?" means READ the clipboard back to the app — security
+          // footgun (any process in the terminal could ex-fil what's
+          // currently on your clipboard). Refuse.
+          if (!b64 || b64 === '?') return false;
+          let text;
+          try { text = atob(b64); } catch { return false; }
+          // Decode UTF-8 properly (atob gives Latin-1; we want UTF-8).
+          try {
+            text = decodeURIComponent(escape(text));
+          } catch { /* leave as-is on decode error */ }
+          if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(text).catch((err) => {
+              console.warn('[osc52] clipboard write rejected:', err.message);
+            });
+          }
+          return true;
+        });
+
         try {
           const webgl = new WebglAddon.WebglAddon();
           webgl.onContextLoss(() => webgl.dispose());

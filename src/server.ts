@@ -48,6 +48,7 @@ import {
   disableTmuxStatus,
   disableTmuxRightClickMenu,
   keepTmuxSelectionAfterDrag,
+  enableTmuxClipboard,
   type SessionInfo,
 } from './sessions';
 import {
@@ -832,6 +833,10 @@ server.listen(PORT, HOST, () => {
   // Mouse-selection UX: by default tmux clears the highlight the moment
   // you release the drag. Rebind to keep it visible.
   void keepTmuxSelectionAfterDrag();
+  // Bridge tmux's copy buffer to the browser's clipboard via OSC 52.
+  // Without this, drag-copy lands only in tmux's internal buffer and
+  // can't be pasted into anything outside the terminal.
+  void enableTmuxClipboard();
   // tabs are our multiplexing UI — disable tmux's own split-pane keys so
   // accidentally hitting Ctrl-b % doesn't create a pane the user can't
   // reach via the tab bar.
