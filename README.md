@@ -90,6 +90,33 @@ See [PROTOCOL.md](PROTOCOL.md) for the wire format.
 
 ---
 
+## Performance
+
+Numbers from the reference build (Node 20.20.2, aarch64 Debian 12, single
+loopback origin behind Cloudflare Access):
+
+| | |
+|---|---|
+| Cold start (`systemctl start` → port listening) | ~580 ms |
+| WS connect → first server message | 2 ms warm, ~14 ms cold |
+| Keystroke round-trip (stdin → bash echo, through PTY+tmux+bash) | **median 0.8 ms · p95 1.1 ms** |
+| Stdout throughput through the WS+PTY+tmux pipe | ~1.2 MB/s |
+| Resize control → PTY reflects new size (`stty size` round-trip) | median 2.9 ms |
+| Idle RSS / threads / FDs | 53 MB · 11 · 25 |
+| RSS under fuzz/load | ~88 MB peak |
+| Survived in-house fuzz: ~100 hostile WS frames | no crash, no panic |
+
+Method: `node -e` clients on loopback with the actual binary protocol
+(`src/protocol.ts`), measured via `performance.now()`. The reproducer
+batteries are not in the repo (they were one-shot harnesses), but the
+methodology is straightforward to recreate against any deployment.
+
+Caveat: the ~1.2 MB/s terminal-throughput number is bounded by the TTY +
+tmux pass-through, not by Node or `ws`. For bulk data, use the file
+upload/download paths — those skip the TTY layer entirely.
+
+---
+
 ## Prerequisites
 
 Hard requirements:
