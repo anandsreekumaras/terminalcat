@@ -21,6 +21,7 @@
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import type * as pty from 'node-pty';
 
@@ -847,11 +848,14 @@ wss.on('connection', (ws, req) => {
   });
   log.info({ ip, email }, '[ws] open');
   // Tell the client who it is and where it's coming from — frontend
-  // displays this in the bottom #info-bar.
+  // displays this in the bottom #info-bar. user/host let the bottom bar
+  // render a Claude-Code-style `user@host:cwd` status line.
   ws.send(JSON.stringify({
     type: 'connection-info',
     ip,
     email,
+    user: os.userInfo().username,
+    host: os.hostname(),
   }));
 
   ws.on('message', (data: RawData, isBinary: boolean) => {

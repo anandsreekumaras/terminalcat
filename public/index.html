@@ -495,6 +495,17 @@
     .info-pill .icon { color: #9ece6a; }
     .info-pill.muted { color: #6a7088; }
     .info-pill.muted .icon { color: #6a7088; }
+    /* Claude-Code-style status pill — `user@host:cwd` mirrors a shell PS1.
+       Bold-green user/host, bold-blue path, monospace, leading position. */
+    .info-pill.prompt {
+      color: #c0caf5;
+      font-weight: 600;
+      flex: 1 1 auto;       /* take leftover space; ellipsis the path if narrow */
+      min-width: 0;         /* needed for ellipsis to actually fire inside flex */
+    }
+    .info-pill.prompt .ph-userhost { color: #9ece6a; }
+    .info-pill.prompt .ph-sep      { color: #565f89; }
+    .info-pill.prompt .ph-cwd      { color: #7aa2f7; overflow: hidden; text-overflow: ellipsis; }
 
     /* ===== context menu (right-click on desktop) =======================
        Long-press on mobile keeps using the bottom sheet — bigger touch
@@ -1216,6 +1227,8 @@
         case 'connection-info': {
           connInfo.ip = String(msg.ip ?? '?');
           connInfo.email = String(msg.email ?? '?');
+          connInfo.user = String(msg.user ?? '');
+          connInfo.host = String(msg.host ?? '');
           paintInfoBar();
           return;
         }
@@ -2176,16 +2189,17 @@
     // Replaces tmux's status bar. Shows: client count, active session,
     // active cwd, our origin IP (the Cf-Connecting-Ip the server saw).
     const infoBar = document.getElementById('info-bar');
-    const connInfo = { ip: '?', email: '?' };
+    const connInfo = { ip: '?', email: '?', user: '', host: '' };
     const sessionClients = new Map();   // sessionId -> count
 
     function paintInfoBar() {
       infoBar.innerHTML = '';
       const id = activeId;
       const t = id ? tabs.get(id) : null;
-      const cwd = t?.cwd ? t.cwd.replace(/^\/home\/[^/]+/, '~') : '';
-      // If we don't yet have a server-pushed count, show "1" if a session
-      // is attached on our end (we know we're at least a subscriber).
+      const fullCwd = t?.cwd || '';
+      // Short form for the muted folder pill on the right (still abbreviates
+      // ~/...). The leading prompt-style pill shows the full path.
+      const shortCwd = fullCwd ? fullCwd.replace(/^\/home\/[^/]+/, '~') : '';
       const count = (id && sessionClients.has(id))
         ? sessionClients.get(id)
         : (t?.session ? 1 : 0);
@@ -2204,10 +2218,29 @@
         infoBar.appendChild(p);
       }
 
+      // Prompt-style status pill (Claude-Code-influenced): user@host:cwd.
+      // Mirrors what a shell PS1 would show. Anchored leftmost, takes up
+      // any leftover info-bar space so the path is actually readable on
+      // wide screens, ellipsised on narrow ones.
+      if (connInfo.user && connInfo.host) {
+        const p = document.createElement('span');
+        p.className = 'info-pill prompt';
+        p.title = `signed in as ${connInfo.email}`;
+        const uh = document.createElement('span'); uh.className = 'ph-userhost';
+        uh.textContent = `${connInfo.user}@${connInfo.host}`;
+        const sep = document.createElement('span'); sep.className = 'ph-sep'; sep.textContent = ':';
+        const cw = document.createElement('span'); cw.className = 'ph-cwd';
+        cw.textContent = fullCwd || (id ? '(cwd…)' : '(no session)');
+        p.appendChild(uh);
+        p.appendChild(sep);
+        p.appendChild(cw);
+        infoBar.appendChild(p);
+      }
+
       pill('●', count + (count === 1 ? ' device' : ' devices'),
         { title: 'WebSocket subscribers attached to this session' });
       pill('▸', id || 'no session');
-      if (cwd) pill('🗀', cwd, { muted: true });
+      if (shortCwd) pill('🗀', shortCwd, { muted: true });
       pill('⌂', connInfo.ip, { muted: true, title: `you (${connInfo.email})` });
     }
 
@@ -2219,6 +2252,11 @@
       _origSwitchTo(id);
       paintDetachedBar();
       paintInfoBar();
+      // Refresh cwd immediately on tab switch — otherwise the prompt-style
+      // pill shows "(cwd…)" until the next poll tick (up to 3s).
+      if (id && tabs.get(id)?.subscribed) {
+        sendCtrl({ type: 'session-cwd', id });
+      }
     };
     const _origRemoveTab = removeTab;
     removeTab = function (id) {
