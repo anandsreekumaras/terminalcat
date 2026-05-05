@@ -1,0 +1,25 @@
+#!/bin/sh
+# Drop-in $BROWSER for terminalcat sessions.
+#
+# Why this exists: anything inside the terminal that runs `$BROWSER <url>`
+# (gh, git web subcommands, npm, etc.) defaults to xdg-open / a local
+# Linux browser. On a headless VPS that fails — and even when it doesn't,
+# the YOUR-side browser viewing the terminal session can't follow a
+# localhost-bound OAuth callback URL the local browser would have hit.
+#
+# Setting BROWSER to this script means: print the URL clearly, let the
+# user copy it into the browser that's ACTUALLY viewing the page (their
+# phone, laptop, whatever). Tools that emit a device-code URL (gh, the
+# AWS CLI, etc.) keep working — the user opens github.com/login/device
+# (or the equivalent) on their device, enters the code, the polling
+# loop completes the auth.
+#
+# Set automatically by the server when spawning the PTY (see src/server.ts).
+# To override per-session: `unset BROWSER` or `export BROWSER=...`.
+
+[ "$#" -lt 1 ] && exit 0
+
+printf '\n\033[36m─────────────────────────────────────────────\033[0m\n'
+printf '\033[36m  open this URL in your browser:\033[0m\n'
+printf '  \033[1;37m%s\033[0m\n' "$1"
+printf '\033[36m─────────────────────────────────────────────\033[0m\n\n'

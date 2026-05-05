@@ -88,7 +88,19 @@ function definedEnv(env: NodeJS.ProcessEnv): { [key: string]: string } {
   }
   return out;
 }
-const PTY_ENV = definedEnv(process.env);
+// `BROWSER` makes tools like gh, git, npm, etc. show URLs through our
+// `terminalcat-open` shim instead of trying to launch a local browser
+// on the headless VPS. Without this, `gh auth refresh` (and similar
+// flows that want to open github.com) gets stuck waiting on an OAuth
+// callback that can't reach a local listener — your real browser is on
+// the device viewing this session, not on the VPS. The shim just prints
+// the URL clearly so you can copy it into the browser you're actually
+// using. See `bin/terminalcat-open` for what it does.
+const TERMINALCAT_OPEN = path.resolve(__dirname, '..', 'bin', 'terminalcat-open');
+const PTY_ENV = {
+  ...definedEnv(process.env),
+  BROWSER: TERMINALCAT_OPEN,
+};
 const PTY_CWD = process.env['HOME'] ?? '/tmp';
 
 // === static file serving ===================================================
