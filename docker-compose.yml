@@ -1,0 +1,60 @@
+# Compose file for the "I want a portable sandboxed dev environment"
+# use case. The terminalcat service runs in a container; the shell you
+# get is the container's shell, not the host's. Tools you `apt install`
+# inside live in the container; persistent files live in the named
+# volume on /home/node.
+#
+# Quick start:
+#   1. Set CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD in a `.env` next to
+#      this file (compose reads it automatically). Use a unique app
+#      hostname per container deployment so the JWT AUD doesn't collide.
+#   2. docker compose build
+#   3. docker compose up -d
+#   4. Run cloudflared somewhere (sidecar profile below, or on the host)
+#      pointing your CF Access hostname at http://127.0.0.1:7682.
+#
+# To also run cloudflared as a sidecar (set CLOUDFLARE_TUNNEL_TOKEN in .env):
+#   docker compose --profile tunnel up -d
+
+services:
+  terminalcat:
+    image: terminalcat:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: terminalcat
+    # network_mode: host — container shares the host's network namespace so
+    # the server's 127.0.0.1:7682 bind IS the host's 127.0.0.1:7682.
+    # Same threat model as bare-metal install: nothing reachable off-box
+    # except via cloudflared.
+    network_mode: host
+    environment:
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?CF_ACCESS_TEAM_DOMAIN is required (see README)}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:?CF_ACCESS_AUD is required (see README)}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_DIR: ${LOG_DIR:-}
+    volumes:
+      # Persistent /home/node — tmux sessions and anything you write to
+      # the home directory survive `docker compose down`. Drop this line
+      # if you want a fully ephemeral container.
+      - terminalcat-home:/home/node
+      # Optional: mount real host directories into the container so the
+      # web shell can work on them. Uncomment + adjust as needed.
+      # - ./workspace:/home/node/workspace
+    restart: unless-stopped
+
+  # Optional cloudflared sidecar. Activate with `--profile tunnel`. Uses
+  # a token from a dashboard-managed tunnel (Zero Trust → Networks →
+  # Tunnels → <your tunnel> → Configure → connector token).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: terminalcat-tunnel
+    network_mode: host
+    command: tunnel --no-autoupdate --metrics 127.0.0.1:0 run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    profiles: [tunnel]
+    depends_on:
+      - terminalcat
+
+volumes:
+  terminalcat-home:

@@ -224,6 +224,81 @@ with the bash prompt.
 
 ---
 
+## Run in Docker (alternative deploy path)
+
+> **Honest framing first.** Docker gives you shell **inside the container**,
+> not on the host. Read this before assuming Docker is what you want:
+>
+> - **"I want a portable, sandboxed remote dev environment reachable from my
+>   phone"** → ✅ Docker is exactly right. The container has its own bash,
+>   its own tmux server, its own `apt` packages. Persistent files live on a
+>   named volume. The host's `/etc`, `/home`, processes, etc. are invisible
+>   to the web shell.
+> - **"I want to manage my actual VPS via web shell"** → ❌ Docker is the
+>   wrong tool. The container's shell can't see your host's running services
+>   without privileged mounts (`docker.sock`, `/`) that defeat the
+>   sandboxing. Use the bare-metal install (`scripts/install.sh`) instead.
+
+### Quick start
+
+```bash
+git clone https://github.com/anandsreekumaras/terminalcat.git
+cd terminalcat
+
+# 1. Set up env (edit values from your Cloudflare Access app)
+cp .env.example .env
+$EDITOR .env
+
+# 2. Build the image
+docker compose build
+
+# 3. Run terminalcat
+docker compose up -d
+
+# 4. (Optional) also run cloudflared as a sidecar — set
+# CLOUDFLARE_TUNNEL_TOKEN in .env first, then:
+docker compose --profile tunnel up -d
+```
+
+The container listens on `127.0.0.1:7682` via `network_mode: host`, same
+threat model as the bare-metal install (loopback only — nothing reaches
+the network without going through `cloudflared`).
+
+### Image stats
+
+| | |
+|---|---|
+| Base | `node:20-bookworm-slim` (multi-stage build prunes dev deps) |
+| Compressed image | ~150 MB |
+| On-disk after pull | ~330 MB |
+| Includes | Node 20, `tmux`, `tini` (for clean SIGTERM forwarding), the compiled app |
+| Excludes | build tools, source maps stay (debugging help), test framework |
+
+### Persistence
+
+`/home/node` inside the container is mounted to the named volume
+`terminalcat-home`. Anything you write there — `~/.bashrc`, target lists,
+`apt`-installed tools, tmux session output — survives `docker compose down`.
+
+To also expose host directories into the container, add a bind mount in
+`docker-compose.yml`:
+
+```yaml
+volumes:
+  - terminalcat-home:/home/node
+  - ./recon:/home/node/recon    # host's ./recon → container's ~/recon
+```
+
+### Limitations
+
+- The shell **cannot see the host filesystem or processes**. By design.
+- The `webdl` / `webnotify` shims work, but their UNIX socket lives inside
+  the container at `/tmp/terminalcat-1000.sock` — they can't be called from
+  outside the container.
+- If you mount `docker.sock` to manage Docker from the web shell, you've
+  effectively given that shell root on the host. Don't, unless you really
+  meant it.
+
 ## Mobile install (PWA)
 
 After the URL is reachable, install it as an app on your phone:

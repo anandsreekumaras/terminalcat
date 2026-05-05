@@ -1,0 +1,35 @@
+# Keep the build context small — Docker uploads everything in this dir to
+# the daemon, so excluded files speed up `docker build` and avoid leaking
+# private values into image layers.
+
+.git/
+.github/
+.claude/
+
+node_modules/
+dist/
+.pnpm-store/
+
+# secrets / per-machine
+.env
+.env.*
+res.sh
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.log
+
+# project-internal docs that don't need to be in the image
+docs/
+deploy/
+scripts/
+TODO.md
+SECURITY.md
+PROTOCOL.md
+README.md
+LICENSE
