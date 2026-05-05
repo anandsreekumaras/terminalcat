@@ -397,6 +397,37 @@ TODO.md               # explicitly out-of-scope items
 
 ---
 
+## Reliability — what survives what
+
+| Failure                           | Recovery |
+|---|---|
+| terminalcat process crashes       | systemd `Restart=always`, RestartSec=2s, back online in seconds. WS clients auto-reconnect (banner: "reconnecting…"). |
+| OOM kill                          | systemd restart. `MemoryMax=1G`, `OOMScoreAdjust=-100` so the kernel kills cloudflared / tmux *before* terminalcat under memory pressure. |
+| Crash loop (something genuinely broken) | systemd backs off after 10 restarts in 60s (`StartLimitBurst=10` / `StartLimitIntervalSec=60`); service enters `failed`. Check `journalctl -u terminalcat -n 100`. |
+| Box reboots                       | `terminalcat.service` is `enable`d → starts on boot. cloudflared service likewise. |
+| cloudflared tunnel disconnects    | cloudflared retries automatically. No action on terminalcat side — origin stays loopback-only. |
+| WS connection drops mid-session   | Frontend auto-reconnects (exponential backoff, capped 30s). Tabs re-subscribe; xterm content is preserved. |
+| Browser closes                    | tmux session keeps running. Reopen the page → tabs come back, click to reattach. |
+| ⚠️ **Box reboots WITH active tmux sessions**  | tmux server dies with the box; sessions are NOT preserved across hard reboots. To preserve, add [tmux-resurrect / tmux-continuum](https://github.com/tmux-plugins/tmux-resurrect) to your `~/.tmux.conf`. Out of v2 scope. |
+| Disk fills up                     | pino-roll's daily rotation caps total log usage at ~700MB (50MB × 14). Beyond that, writes fail; service may crash; systemd restarts. Set up host-level disk monitoring. |
+| TLS cert / Cloudflare outage      | Origin keeps serving on loopback; users get cloudflared's edge-side error page. Self-heals when CF recovers. |
+
+### Verifying it's truly auto-running
+
+```bash
+# Service running and enabled at boot?
+sudo systemctl is-active terminalcat.service       # active
+sudo systemctl is-enabled terminalcat.service      # enabled
+
+# cloudflared too?
+sudo systemctl is-enabled cloudflared.service
+
+# Crash-recovery sanity check (kills it, expects systemd to bring it back):
+PID=$(systemctl show terminalcat.service --property=MainPID --value)
+sudo kill -9 "$PID" && sleep 3 && \
+  sudo systemctl is-active terminalcat.service     # should still say "active"
+```
+
 ## Verifying clean disconnect (no zombies)
 
 After closing a browser tab — especially mid-running-process — these

@@ -56,6 +56,27 @@ KillMode=mixed
 Restart=always
 RestartSec=2
 
+# Crash-loop guard: allow up to 10 restarts within 60 seconds. Beyond
+# that the service goes into 'failed' state (something is genuinely
+# broken — restarting faster won't help). Default is 5 in 10s, which
+# we found too tight when an upstream change briefly breaks startup.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Resource caps. Defense against a runaway leak / fork bomb / huge
+# upload pinning memory. systemd kills the service on cap; Restart=always
+# brings it back. Adjust upward if you have many concurrent users with
+# massive scrollback retention.
+MemoryMax=1G
+TasksMax=4096
+
+# Make terminalcat slightly *less* attractive to the OOM killer than
+# default (which sits at 0). cloudflared and tmux server should die
+# before us if the box is under memory pressure — we control their
+# restart, but not theirs of us.
+#   range: -1000 (never) … 0 (default) … 1000 (kill first)
+OOMScoreAdjust=-100
+
 # === sandboxing ==========================================================
 # These are deliberately conservative. terminalcat needs:
 #   - net access (for the JWKS fetch on first JWT verify)
