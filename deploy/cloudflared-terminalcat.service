@@ -1,0 +1,68 @@
+# systemd unit for the cloudflared tunnel that fronts terminalcat.
+#
+# This unit is for the *tunnel*, not the origin. The origin has its own
+# unit at deploy/terminalcat.service.
+#
+# Why a separate cloudflared unit (instead of just `cloudflared service install`):
+# the package's default unit installs ONE cloudflared process for ONE
+# tunnel. If you already run other tunnels on this box (codeserver,
+# whatever), `cloudflared service install` would either overwrite or
+# collide. A dedicated, distinctly-named unit sits cleanly alongside.
+#
+# Suggested install:
+#   sudo cp deploy/cloudflared-terminalcat.service \
+#           /etc/systemd/system/cloudflared-terminalcat.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cloudflared-terminalcat.service
+#
+# Logs:
+#   sudo journalctl -u cloudflared-terminalcat.service -f
+
+[Unit]
+Description=cloudflared tunnel for terminalcat
+Documentation=https://github.com/your-fork-of-terminalcat
+# We don't strictly need the origin running before the tunnel — cloudflared
+# retries until the origin is reachable. So no After=terminalcat.service.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# cloudflared uses sd_notify on the systemd protocol so Type=notify is
+# correct (matches the package-installed cloudflared.service default).
+Type=notify
+TimeoutStartSec=0
+
+# Run as the same unprivileged user that owns ~/.cloudflared/cert.pem
+# and the tunnel's credentials JSON. Outbound tunnels don't need root.
+User=ubuntu
+Group=ubuntu
+
+# ----- per-machine paths (edit before installing) -----
+# The config file is a YAML referencing the credentials JSON for THIS
+# tunnel. See the parallel deploy/cloudflared.yml in this repo for the
+# format. A typical layout:
+#
+#   /home/ubuntu/.cloudflared/<tunnel-uuid>.json   (creds, mode 0600)
+#   /home/ubuntu/.cloudflared/terminalcat.yml      (config, mode 0644)
+#
+# Both must be readable by the User= above. cred file is auto-created
+# by `cloudflared tunnel create <name>`.
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --config /home/ubuntu/.cloudflared/terminalcat.yml run
+
+Restart=on-failure
+RestartSec=5s
+
+# Optional hardening — uncomment after first successful boot:
+# NoNewPrivileges=yes
+# ProtectSystem=strict
+# ProtectHome=read-only
+# PrivateTmp=yes
+# ReadWritePaths=/home/ubuntu/.cloudflared
+
+# Match the package-installed cloudflared.service's OOM behaviour: the
+# tunnel is critical infrastructure for remote access; bias the kernel
+# against killing it under memory pressure.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
