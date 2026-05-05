@@ -323,5 +323,11 @@ export function spawnPtyForSession(
     rows,
     cwd,
     env,
+    // encoding:null hands us raw Buffer in onData instead of a UTF-8 string.
+    // We re-pack the bytes as a binary WS frame anyway, so the string path
+    // forced an extra decode+encode round-trip that we now skip. node-pty's
+    // .d.ts insists `data: string` regardless — server.ts casts at the call
+    // site with a comment.
+    encoding: null,
   });
 }

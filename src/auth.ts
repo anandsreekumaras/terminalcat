@@ -38,6 +38,17 @@ const JWKS = createRemoteJWKSet(jwksUrl, {
   timeoutDuration: 5_000,
 });
 
+// JWKS prefetch (network-warm): a fire-and-forget fetch at module load so
+// the TLS session, DNS, and TCP for cloudflareaccess.com are warm before
+// the very first user request arrives. jose's own JWKS cache repopulates
+// on first verify, but its fetch then reuses the warmed connection.
+// Saves the cold first-request ~150–250ms.
+fetch(jwksUrl.toString()).then((r) => r.arrayBuffer()).catch(() => {
+  // Best effort. If CF is briefly unreachable here, jose retries on the
+  // first real verifyAccessJwt call. We don't want a failing prefetch to
+  // crash startup or even surface in logs at info level.
+});
+
 export type AuthOk = { ok: true; email: string; sub: string };
 export type AuthFail = { ok: false; reason: string };
 export type AuthResult = AuthOk | AuthFail;
