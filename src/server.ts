@@ -156,6 +156,37 @@ function etagFor(stat: fs.Stats): string {
   return `W/"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
 }
 
+// Send one file with ETag-aware response. Shared between the direct-match
+// path and the SPA fallback so both get identical 304 / cache behaviour.
+function sendFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  file: string,
+  stat: fs.Stats,
+): void {
+  const etag = etagFor(stat);
+  const cc = cacheControlFor(file);
+  const inm = req.headers['if-none-match'];
+  if (typeof inm === 'string' && inm === etag) {
+    res.writeHead(304, { 'ETag': etag, 'Cache-Control': cc });
+    res.end();
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': mimeFor(file),
+    'Content-Length': stat.size,
+    'Cache-Control': cc,
+    'ETag': etag,
+  });
+  if (req.method === 'HEAD') { res.end(); return; }
+  fs.createReadStream(file).pipe(res);
+}
+
+function send404(res: http.ServerResponse): void {
+  res.writeHead(404, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+  res.end('not found\n');
+}
+
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'Allow': 'GET, HEAD' });
@@ -174,29 +205,30 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void 
   }
 
   fs.stat(candidate, (err, stat) => {
-    if (err || !stat.isFile()) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('not found\n');
+    if (!err && stat.isFile()) {
+      sendFile(req, res, candidate, stat);
       return;
     }
-    const etag = etagFor(stat);
-    const cc = cacheControlFor(candidate);
-    // Conditional GET — if the client's cached copy still matches, respond
-    // 304 with no body. The browser reuses what it already has.
-    const inm = req.headers['if-none-match'];
-    if (typeof inm === 'string' && inm === etag) {
-      res.writeHead(304, { 'ETag': etag, 'Cache-Control': cc });
-      res.end();
+    // SPA fallback: paths that look like routes (no extension) get
+    // index.html so e.g. /tab/foo or a bookmarked deep link loads the
+    // app and the frontend handles it (or just renders the default
+    // state — terminalcat doesn't have client-side routing today).
+    // Paths with extensions stay as a clean 404 so missing assets
+    // surface in devtools instead of being masked by a 200 HTML body.
+    if (path.extname(pathname)) {
+      send404(res);
       return;
     }
-    res.writeHead(200, {
-      'Content-Type': mimeFor(candidate),
-      'Content-Length': stat.size,
-      'Cache-Control': cc,
-      'ETag': etag,
+    const indexPath = path.resolve(PUBLIC_DIR, 'index.html');
+    fs.stat(indexPath, (err2, stat2) => {
+      if (err2 || !stat2.isFile()) {
+        // Pathological: index.html missing. Only happens if someone
+        // deletes public/index.html out from under the running server.
+        send404(res);
+        return;
+      }
+      sendFile(req, res, indexPath, stat2);
     });
-    if (req.method === 'HEAD') { res.end(); return; }
-    fs.createReadStream(candidate).pipe(res);
   });
 }
 
