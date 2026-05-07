@@ -122,6 +122,40 @@ function mimeFor(p: string): string {
   return MIME[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
 }
 
+// Per-extension caching policy. Goal: keep `index.html` and `sw.js` always
+// revalidating (so deploys land instantly) while letting browsers reuse
+// the static assets that almost never change. ETag-based revalidation
+// means even the "no-cache" path benefits from 304s — no body re-sent.
+function cacheControlFor(p: string): string {
+  const ext = path.extname(p).toLowerCase();
+  switch (ext) {
+    case '.html':
+    case '.js':
+      // Includes sw.js explicitly: must always revalidate so SW updates land.
+      // `no-cache` doesn't mean "don't cache" — it means "use cache but
+      // revalidate every time" (sends If-None-Match → 304 if unchanged).
+      return 'no-cache, must-revalidate';
+    case '.svg':
+    case '.png':
+    case '.ico':
+    case '.woff2':
+    case '.webmanifest':
+      // Static assets that change rarely. 1 day cache + immutable hint
+      // makes repeat visits skip the network entirely for these.
+      return 'public, max-age=86400';
+    default:
+      return 'no-store';
+  }
+}
+
+// Cheap ETag — same shape Express uses by default. Combines mtime and size,
+// hex-formatted. Stable enough for revalidation (changes when file changes),
+// not a content hash. If we ever care about distinguishing identical-mtime
+// edits we'd swap for sha1, but for terminalcat's tiny file count this is fine.
+function etagFor(stat: fs.Stats): string {
+  return `W/"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
+}
+
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     res.writeHead(405, { 'Allow': 'GET, HEAD' });
@@ -145,10 +179,21 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void 
       res.end('not found\n');
       return;
     }
+    const etag = etagFor(stat);
+    const cc = cacheControlFor(candidate);
+    // Conditional GET — if the client's cached copy still matches, respond
+    // 304 with no body. The browser reuses what it already has.
+    const inm = req.headers['if-none-match'];
+    if (typeof inm === 'string' && inm === etag) {
+      res.writeHead(304, { 'ETag': etag, 'Cache-Control': cc });
+      res.end();
+      return;
+    }
     res.writeHead(200, {
       'Content-Type': mimeFor(candidate),
       'Content-Length': stat.size,
-      'Cache-Control': 'no-store',
+      'Cache-Control': cc,
+      'ETag': etag,
     });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(candidate).pipe(res);
