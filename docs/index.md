@@ -17,6 +17,8 @@ land. Auth-gated by Cloudflare Access at the edge — no public ports.
 [Get started](./getting-started.html){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [Source on GitHub](https://github.com/anandsreekumaras/terminalcat){: .btn .fs-5 .mb-4 .mb-md-0 }
 
+![terminalcat demo](./screenshots/demo.svg)
+
 ---
 
 ## Why this exists

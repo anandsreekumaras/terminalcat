@@ -16,6 +16,13 @@
 > issues read as time permits, no support SLA. See [SECURITY.md](SECURITY.md)
 > before deploying to anything you care about.
 
+![terminalcat demo](docs/screenshots/demo.svg)
+
+> Animated SVG: simulated session showing a `nuclei` scan, a tab swap, and a
+> `webdl` download to the device. Generated content (no real targets in the
+> output). Static SVG re-rendered to a real screen GIF is on the
+> [TODO list](TODO.md).
+
 ---
 
 ## Why this exists

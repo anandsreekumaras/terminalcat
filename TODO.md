@@ -21,3 +21,9 @@ Tracked here so they don't sneak into v2 PRs. Reconsider after v2 ships.
   assets and confuses debugging. Reconsider only if there's a real reason.
 - **Custom font upload.** Bring-your-own webfont. Today the font stack is
   hardcoded to system monospaces.
+- **Real screen-recorded demo GIF.** `docs/screenshots/demo.svg` is currently
+  a hand-authored SMIL animation (no actual session captured). Re-record with
+  [`vhs`](https://github.com/charmbracelet/vhs) once there's a stable
+  desktop+mobile env to drive it from. Shape: ~10s loop, hand-typed `nuclei`
+  scan + tab-swap + `webdl` download. Output goes to
+  `docs/screenshots/demo.gif`; swap the README + `docs/index.md` references.
