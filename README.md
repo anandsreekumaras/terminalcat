@@ -159,7 +159,8 @@ The installer:
    corepack, tmux, git, build-essential / gcc-c++, cloudflared).
 3. Clones/updates the repo.
 4. Runs `pnpm install` (compiles node-pty from source on aarch64).
-5. Prompts interactively for `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD`.
+5. Prompts interactively for `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`,
+   and `ALLOWED_ORIGIN` (the public URL users will load the app at).
    See **Cloudflare setup** below for where to find these.
 6. Optionally installs the systemd unit (`Restart=always`, non-root user).
 7. Optionally symlinks the `webdl` and `webnotify` CLI shims into
@@ -251,14 +252,22 @@ Save. Open the new app → **Overview** tab → copy:
 - Your **team domain** — the part before `.cloudflareaccess.com`. Find it
   top-left of the Zero Trust dashboard, or under Settings → General.
 
-Paste both into `.env`:
+Paste both into `.env`, plus the canonical URL users will load the app at
+(used as a server-side CSWSH defense — recommended in production):
 
 ```bash
 CF_ACCESS_TEAM_DOMAIN=acme
 CF_ACCESS_AUD=0000000000000000000000000000000000000000000000000000000000000000
+ALLOWED_ORIGIN=https://shell.example.com
 ```
 
-The installer prompts for these — you can skip step 3 here and answer
+`ALLOWED_ORIGIN` is optional. If set, WS upgrades whose `Origin` header
+doesn't match get a 403; missing Origin (CLI tools, monitoring) falls
+through to the JWT check. Cloudflare Access' default `SameSite=Lax`
+cookie already blocks the obvious browser CSWSH path, but this hardens
+the `SameSite=None` edge case at zero cost.
+
+The installer prompts for all three — you can skip this step and answer
 the installer's questions instead.
 
 ### 4. Visit the URL

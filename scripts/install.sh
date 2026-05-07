@@ -322,13 +322,14 @@ install_deps() {
 # ===== env ================================================================
 prompt_env() {
   local env_file="$INSTALL_DIR/.env"
-  local existing_team_domain="" existing_aud="" existing_log_dir=""
+  local existing_team_domain="" existing_aud="" existing_log_dir="" existing_origin=""
 
   if [ -f "$env_file" ]; then
     yellow "  ⚠ $env_file already exists — current values shown as defaults; press Enter to keep"
     existing_team_domain=$(grep -E '^CF_ACCESS_TEAM_DOMAIN=' "$env_file" | head -1 | cut -d= -f2- || true)
     existing_aud=$(grep -E '^CF_ACCESS_AUD=' "$env_file" | head -1 | cut -d= -f2- || true)
     existing_log_dir=$(grep -E '^LOG_DIR=' "$env_file" | head -1 | cut -d= -f2- || true)
+    existing_origin=$(grep -E '^ALLOWED_ORIGIN=' "$env_file" | head -1 | cut -d= -f2- || true)
   fi
 
   blue ""
@@ -338,7 +339,7 @@ prompt_env() {
   echo "    AUD tag     → Access > Applications > <your app> > Overview > Application Audience Tag"
   echo "  See README.md \"Cloudflare setup\" for a full walkthrough."
 
-  local team_domain aud log_dir
+  local team_domain aud log_dir allowed_origin
 
   read -r -p "  CF_ACCESS_TEAM_DOMAIN${existing_team_domain:+ [$existing_team_domain]}: " team_domain </dev/tty
   team_domain=${team_domain:-$existing_team_domain}
@@ -348,6 +349,32 @@ prompt_env() {
   aud=${aud:-$existing_aud}
   [ -z "$aud" ] && abort "CF_ACCESS_AUD is required"
 
+  blue ""
+  blue "→ ALLOWED_ORIGIN (recommended)"
+  echo "  CSWSH defense-in-depth. Set to the canonical URL where users will load"
+  echo "  terminalcat (e.g. https://shell.example.com). When set, WS upgrades"
+  echo "  whose Origin header doesn't match get a 403. Cloudflare Access' default"
+  echo "  SameSite=Lax cookie already blocks the obvious browser CSWSH path; this"
+  echo "  hardens the SameSite=None edge case. Blank to skip (the check stays"
+  echo "  disabled — fine in dev, recommended on for prod)."
+
+  read -r -p "  ALLOWED_ORIGIN${existing_origin:+ [$existing_origin]} (blank to skip): " allowed_origin </dev/tty
+  allowed_origin=${allowed_origin:-$existing_origin}
+  if [ -n "$allowed_origin" ]; then
+    # Add scheme if user typed bare hostname.
+    if ! [[ "$allowed_origin" =~ ^https?:// ]]; then
+      warn "ALLOWED_ORIGIN missing scheme — prepending https://"
+      allowed_origin="https://$allowed_origin"
+    fi
+    # Warn on http (production should be https-only behind Cloudflare).
+    if [[ "$allowed_origin" == http://* ]]; then
+      warn "ALLOWED_ORIGIN is plain http — fine for dev, but production should be https"
+    fi
+    # Strip any trailing slash — the Origin header sent by browsers never has one,
+    # so a trailing slash here would silently fail every check.
+    allowed_origin="${allowed_origin%/}"
+  fi
+
   read -r -p "  LOG_DIR (optional, blank to log to stderr only)${existing_log_dir:+ [$existing_log_dir]}: " log_dir </dev/tty
   log_dir=${log_dir:-$existing_log_dir}
 
@@ -356,10 +383,15 @@ prompt_env() {
 CF_ACCESS_TEAM_DOMAIN=$team_domain
 CF_ACCESS_AUD=$aud
 EOF
+  if [ -n "$allowed_origin" ]; then echo "ALLOWED_ORIGIN=$allowed_origin" >> "$env_file"; fi
   if [ -n "$log_dir" ]; then echo "LOG_DIR=$log_dir" >> "$env_file"; fi
 
   chmod 600 "$env_file"
   ok "wrote $env_file (chmod 600)"
+  if [ -z "$allowed_origin" ]; then
+    yellow "  ↳ ALLOWED_ORIGIN not set: CSWSH defense disabled. Add later by appending"
+    yellow "    ALLOWED_ORIGIN=https://your-host to .env and restarting the service."
+  fi
 }
 
 # ===== systemd ============================================================
