@@ -1,21 +1,36 @@
 ---
-layout: default
 title: Getting started
-description: Install terminalcat on your Linux box, wire up Cloudflare Tunnel + Access, and load it in a browser.
+layout: default
+nav_order: 2
 ---
 
-[← Home](./index.html)
-
 # Getting started
+{: .no_toc }
+
+End-to-end install from a fresh Linux box to a working SSO-gated terminal.
+{: .fs-6 .fw-300 }
+
+<details open markdown="block">
+<summary>
+  Table of contents
+</summary>
+{: .text-delta }
+1. TOC
+{:toc}
+</details>
+
+---
 
 ## Prerequisites
 
-- A Linux box (tested on Debian 12, Ubuntu 22.04+, Fedora 39+; aarch64 and x86_64 both work)
-- A Cloudflare account with a domain in it (free tier works)
-- Cloudflare Zero Trust enabled on the account (free for up to 50 users)
+| | |
+|---|---|
+| OS | Linux (tested on Debian 12, Ubuntu 22.04+, Fedora 39+; aarch64 and x86_64) |
+| Account | Cloudflare account with a domain in it (free tier is enough) |
+| Zero Trust | Cloudflare Zero Trust enabled (free for up to 50 users) |
 
-The installer brings in everything else — Node 20+, pnpm via corepack, tmux,
-git, build-essential, cloudflared.
+The installer handles everything else — Node 20+, pnpm via corepack, tmux,
+git, build-essential / gcc-c++, cloudflared.
 
 ## One-liner install
 
@@ -35,6 +50,8 @@ The installer:
 
 Idempotent. Safe to re-run for upgrades.
 
+Override knobs via env: `TERMINALCAT_REPO=<your fork>` · `TERMINALCAT_DIR=<custom path>` · `ASSUME_YES=1` (auto-accept all prompts).
+
 ## Cloudflare setup
 
 terminalcat doesn't open a public port. Traffic reaches it through a
@@ -50,7 +67,7 @@ cloudflared tunnel route dns terminalcat shell.YOUR-DOMAIN
 
 `cloudflared tunnel create` prints a UUID + a path to the credentials JSON.
 Copy `deploy/cloudflared.yml` to `~/.cloudflared/terminalcat.yml` and replace
-`REPLACE-WITH-YOUR-TUNNEL-UUID` with the UUID printed above.
+`REPLACE-WITH-YOUR-TUNNEL-UUID` (both lines) with the UUID printed above.
 
 ### 2. Run the tunnel as a systemd service
 
@@ -62,30 +79,31 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now cloudflared-terminalcat.service
 ```
 
-⚠️ **Don't use `sudo cloudflared service install`** — that's the dashboard-token
-flow and will collide with any other tunnel you have on the box.
+⚠️ **Do NOT use `sudo cloudflared service install`** — that's the dashboard-token
+flow and will collide with any other tunnel you have on the box. The dedicated
+unit above sits cleanly alongside.
 
 ### 3. Create the Cloudflare Access application
 
-Cloudflare Zero Trust dashboard → Access → Applications → Add → Self-hosted:
+Cloudflare Zero Trust dashboard → **Access** → **Applications** → **Add an Application** → **Self-hosted**:
 
 | Field | Value |
 |---|---|
 | Application name | `terminalcat` |
 | Application domain | `shell.YOUR-DOMAIN` |
-| Session duration | 24h (or shorter) |
+| Session duration | 24h (or shorter — your call) |
 
 Add a policy:
 
 - **Action:** Allow
 - **Selector:** Emails → your email address (NOT "any email from `<my domain>`" — old or compromised employees may still hold the address)
 
-Save. Open the new app → Overview tab → copy:
+Save. Open the new app → **Overview** tab → copy:
 
 - **Application Audience (AUD) Tag** — 64-char hex string
 - **Team domain** — the part before `.cloudflareaccess.com`. Find it top-left of Zero Trust dashboard, or under Settings → General
 
-Paste both into `.env`:
+Paste them into `.env` (the installer will have prompted for these too):
 
 ```bash
 CF_ACCESS_TEAM_DOMAIN=acme
@@ -93,7 +111,7 @@ CF_ACCESS_AUD=0000000000000000000000000000000000000000000000000000000000000000
 ALLOWED_ORIGIN=https://shell.YOUR-DOMAIN
 ```
 
-`ALLOWED_ORIGIN` is optional but recommended — server-side CSWSH defense.
+`ALLOWED_ORIGIN` enables the [server-side CSWSH defense](./security.html#cswsh-defense). Recommended for production.
 
 ### 4. Visit
 
@@ -102,7 +120,7 @@ https://shell.YOUR-DOMAIN/
 ```
 
 You should be redirected to `https://<team>.cloudflareaccess.com/` for the
-SSO flow. After authenticating, you land back on terminalcat.
+SSO flow. After authenticating, you land back on terminalcat with bash.
 
 ## Updating
 
@@ -111,12 +129,12 @@ cd ~/terminalcat
 ./scripts/update.sh
 ```
 
-Pulls main, rebuilds, restarts the systemd service.
+Pulls main, rebuilds (the systemd unit runs the compiled `dist/server.js`),
+restarts the service. Idempotent. Refuses to run on a dirty working tree
+unless you pass `--no-pull`.
 
-## More
+## Mobile install ("Add to Home Screen")
 
-- [Source + README](https://github.com/anandsreekumaras/terminalcat) — full README with screenshots, mobile install, "Add to Home Screen", etc.
-- [Wire protocol](https://github.com/anandsreekumaras/terminalcat/blob/main/PROTOCOL.md)
-- [Security](https://github.com/anandsreekumaras/terminalcat/blob/main/SECURITY.md)
-- [Contributing](https://github.com/anandsreekumaras/terminalcat/blob/main/CONTRIBUTING.md)
-- [TODO (out-of-scope items)](https://github.com/anandsreekumaras/terminalcat/blob/main/TODO.md)
+Once the URL works in mobile Safari / Chrome, see [Mobile UX](./mobile.html)
+for installing it as a real PWA — full-screen, helper bar above the keyboard,
+launches like a native app.

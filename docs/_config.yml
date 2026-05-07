@@ -1,22 +1,44 @@
 title: terminalcat
-description: A self-hosted web terminal that doesn't kill your processes when you close the browser. Multi-tab. Mobile-friendly. Cloudflare-Access-gated.
+description: Self-hosted web terminal — multi-session, mobile-friendly, Cloudflare-Access-gated. Backed by tmux for session persistence; closing the browser doesn't kill anything.
 
-# Cayman is GitHub's own theme — minimal, well-maintained, zero-config.
-# Swap to just-the-docs / minimal-mistakes later if doc volume grows.
-theme: jekyll-theme-cayman
+# just-the-docs is built for documentation: full sidebar nav, search,
+# breadcrumbs, page hierarchy via front-matter. Rendered in GitHub Pages
+# via remote_theme (no Gemfile / bundler needed locally).
+remote_theme: just-the-docs/just-the-docs
 
-# Used by SEO + sitemap plugins (no-ops without them, harmless).
+# Used by SEO + sitemap plugins.
 url: https://terminalcat.anandsreekumar.com
 repository: anandsreekumaras/terminalcat
 
-# Stop Jekyll from copying these out of /docs into /_site (we don't need
-# multiple READMEs in the published site).
+# just-the-docs config
+color_scheme: dark
+search_enabled: true
+search:
+  heading_level: 3
+  previews: 3
+  preview_words_before: 5
+  preview_words_after: 10
+heading_anchors: true
+
+aux_links:
+  "GitHub":
+    - "https://github.com/anandsreekumaras/terminalcat"
+aux_links_new_tab: true
+
+footer_content: 'terminalcat — <a href="https://github.com/anandsreekumaras/terminalcat">github.com/anandsreekumaras/terminalcat</a> · MIT License'
+
+# Stop Jekyll from copying these out of /docs into /_site.
 exclude:
-  - README.md
   - vendor
 
-# GitHub Pages restricts plugins to a known list — these two are safe and
-# add SEO tags + a sitemap for free.
 plugins:
   - jekyll-seo-tag
   - jekyll-sitemap
+  - jekyll-remote-theme
+
+# Defaults: every page gets layout=default unless it overrides.
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

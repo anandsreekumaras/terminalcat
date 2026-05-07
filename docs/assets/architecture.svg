@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 720" font-family="ui-monospace, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13">
+  <!--
+    terminalcat architecture, Tokyo Night palette. Vertical flow:
+      browser → CF Access → cloudflared tunnel → origin → node-pty → tmux → user processes
+    Each arrow labels what's actually flowing on the wire.
+  -->
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7aa2f7"/>
+    </marker>
+    <marker id="arrow-quic" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bb9af7"/>
+    </marker>
+    <marker id="arrow-int" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9ece6a"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1a1b26"/>
+      <stop offset="1" stop-color="#16161e"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="920" height="720" fill="url(#bg)"/>
+
+  <!-- ===== Box helper styles via reuse ===== -->
+  <!-- Edge of trust — public network -->
+  <text x="20" y="32" fill="#565f89" font-size="11">PUBLIC INTERNET</text>
+  <line x1="20" y1="40" x2="900" y2="40" stroke="#414868" stroke-dasharray="3,4"/>
+
+  <!-- Browser -->
+  <g>
+    <rect x="120" y="60" width="280" height="80" rx="10" fill="#24283b" stroke="#7aa2f7" stroke-width="1.5"/>
+    <text x="260" y="86" text-anchor="middle" fill="#7aa2f7" font-size="14" font-weight="bold">browser / PWA</text>
+    <text x="260" y="106" text-anchor="middle" fill="#a9b1d6" font-size="11">xterm.js · WebGL · service worker</text>
+    <text x="260" y="124" text-anchor="middle" fill="#565f89" font-size="11">desktop · iOS · Android</text>
+  </g>
+
+  <!-- Mobile glyph next to browser -->
+  <g>
+    <rect x="430" y="78" width="36" height="60" rx="6" fill="#24283b" stroke="#7aa2f7" stroke-width="1.5"/>
+    <rect x="436" y="86" width="24" height="40" fill="#1a1b26"/>
+    <circle cx="448" cy="132" r="2" fill="#7aa2f7"/>
+  </g>
+
+  <!-- Arrow: browser -> CF Access -->
+  <line x1="260" y1="148" x2="260" y2="190" stroke="#7aa2f7" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="270" y="172" fill="#a9b1d6" font-size="11">https + WSS</text>
+
+  <!-- Cloudflare Access -->
+  <g>
+    <rect x="60" y="195" width="800" height="90" rx="10" fill="#1f2335" stroke="#bb9af7" stroke-width="1.5"/>
+    <text x="80" y="218" fill="#bb9af7" font-size="14" font-weight="bold">Cloudflare Access (edge)</text>
+    <text x="80" y="240" fill="#a9b1d6">SSO · session cookie · mints signed JWT (RS256, &lt;TEAM&gt;.cloudflareaccess.com / &lt;AUD&gt;)</text>
+    <text x="80" y="260" fill="#a9b1d6">injects: <tspan fill="#7aa2f7">Cf-Access-Jwt-Assertion</tspan> · <tspan fill="#7aa2f7">Cf-Connecting-Ip</tspan></text>
+    <text x="80" y="278" fill="#565f89" font-size="11">policy = email allowlist  ·  session = 24h  ·  no public origin port</text>
+  </g>
+
+  <!-- Arrow: Access -> tunnel -->
+  <line x1="460" y1="290" x2="460" y2="330" stroke="#bb9af7" stroke-width="2" marker-end="url(#arrow-quic)"/>
+  <text x="470" y="312" fill="#a9b1d6" font-size="11">QUIC outbound (no inbound port)</text>
+
+  <!-- VPS boundary -->
+  <text x="20" y="355" fill="#565f89" font-size="11">YOUR LINUX BOX</text>
+  <line x1="20" y1="363" x2="900" y2="363" stroke="#414868" stroke-dasharray="3,4"/>
+
+  <!-- cloudflared tunnel -->
+  <g>
+    <rect x="60" y="375" width="800" height="64" rx="10" fill="#1f2335" stroke="#bb9af7" stroke-width="1.5"/>
+    <text x="80" y="398" fill="#bb9af7" font-size="14" font-weight="bold">cloudflared (systemd: cloudflared-terminalcat.service)</text>
+    <text x="80" y="420" fill="#a9b1d6">QUIC ↔ origin proxy · 4 POPs registered · OOMScoreAdjust=-500 · auto-reconnect</text>
+  </g>
+
+  <!-- Arrow: tunnel -> origin -->
+  <line x1="460" y1="442" x2="460" y2="478" stroke="#9ece6a" stroke-width="2" marker-end="url(#arrow-int)"/>
+  <text x="470" y="464" fill="#a9b1d6" font-size="11">http (loopback only — 127.0.0.1:7682)</text>
+
+  <!-- Origin server -->
+  <g>
+    <rect x="60" y="488" width="800" height="100" rx="10" fill="#1f2335" stroke="#9ece6a" stroke-width="1.5"/>
+    <text x="80" y="510" fill="#9ece6a" font-size="14" font-weight="bold">terminalcat origin (systemd: terminalcat.service)</text>
+    <text x="80" y="530" fill="#a9b1d6">Node 20 · TS strict · ws · jose · pino · zod</text>
+    <text x="80" y="548" fill="#a9b1d6">auth gate → static handler → WS upgrade → multiplexer (one WS, N sessions)</text>
+    <text x="80" y="566" fill="#565f89" font-size="11">defenses: loopback bind · JWT verify (aud+iss+exp) · Origin allowlist · Cf-Connecting-Ip presence</text>
+    <text x="80" y="582" fill="#565f89" font-size="11">protocol: tagged binary frames + JSON control · permessage-deflate off · WS keepalive 30s</text>
+  </g>
+
+  <!-- Arrow: origin -> node-pty -->
+  <line x1="460" y1="591" x2="460" y2="624" stroke="#9ece6a" stroke-width="2" marker-end="url(#arrow-int)"/>
+
+  <!-- node-pty -->
+  <g>
+    <rect x="200" y="630" width="520" height="34" rx="8" fill="#1f2335" stroke="#e0af68" stroke-width="1.5"/>
+    <text x="460" y="652" text-anchor="middle" fill="#e0af68" font-weight="bold">node-pty</text>
+    <text x="710" y="652" fill="#565f89" font-size="11">one PTY child per attached session</text>
+  </g>
+
+  <!-- Arrow: node-pty -> tmux -->
+  <line x1="460" y1="668" x2="460" y2="694" stroke="#e0af68" stroke-width="2" marker-end="url(#arrow-int)"/>
+
+  <!-- tmux + user processes -->
+  <g>
+    <rect x="60" y="700" width="800" height="14" rx="6" fill="#1f2335" stroke="#f7768e" stroke-width="1"/>
+    <text x="80" y="711" fill="#f7768e" font-size="11" font-weight="bold">tmux server (PPID=1)</text>
+    <text x="240" y="711" fill="#a9b1d6" font-size="11">→ bash · vim · htop · nuclei · your processes (outlive Node restarts)</text>
+  </g>
+</svg>
