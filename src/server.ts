@@ -906,17 +906,20 @@ function bumpDown(ws: WebSocket, n: number): void {
 }
 
 server.on('upgrade', (req, socket, head) => {
-  // CSWSH defense-in-depth. If ALLOWED_ORIGIN is configured, the WS upgrade
-  // must come from that exact origin. Browsers always send `Origin` on WS
-  // upgrades, so a missing Origin while ALLOWED_ORIGIN is set means it's
-  // not from a real browser tab on the canonical hostname — reject.
+  // CSWSH defense-in-depth. If ALLOWED_ORIGIN is configured AND the request
+  // carries an Origin header, it must match. Permissive-missing semantics:
+  // browsers always send Origin on WS upgrades from a document context —
+  // that's the only attack vector for CSWSH. Non-browser tools (curl,
+  // wscat, monitoring agents) typically omit Origin entirely; for those
+  // the JWT check is the actual gate. This matches what most frameworks
+  // do (e.g., Django Channels' AllowedHostsOriginValidator).
   // (We don't apply this to plain HTTP because terminalcat's HTTP path is
   // read-only static files; CSRF on a GET-only surface is theatre.)
   if (config.ALLOWED_ORIGIN) {
     const origin = req.headers.origin;
-    if (typeof origin !== 'string' || origin !== config.ALLOWED_ORIGIN) {
+    if (typeof origin === 'string' && origin !== config.ALLOWED_ORIGIN) {
       log.warn(
-        `[auth] ws 403 ip=${clientIp(req)} origin=${JSON.stringify(origin ?? null)} reason="origin not allowed"`,
+        `[auth] ws 403 ip=${clientIp(req)} origin=${JSON.stringify(origin)} reason="origin not allowed"`,
       );
       socket.write(
         'HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',

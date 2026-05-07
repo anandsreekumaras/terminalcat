@@ -36,9 +36,10 @@ jobs:
           node-version: "20"
 
       - name: Enable pnpm via corepack
-        run: |
-          corepack enable
-          corepack prepare pnpm@latest --activate
+        # `corepack enable` honours the `packageManager` field in
+        # package.json so CI uses the exact pnpm pinned for prod.
+        # No `corepack prepare` needed.
+        run: corepack enable
 
       - name: Cache pnpm store
         uses: actions/cache@v4
