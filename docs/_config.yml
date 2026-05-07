@@ -1,0 +1,22 @@
+title: terminalcat
+description: A self-hosted web terminal that doesn't kill your processes when you close the browser. Multi-tab. Mobile-friendly. Cloudflare-Access-gated.
+
+# Cayman is GitHub's own theme — minimal, well-maintained, zero-config.
+# Swap to just-the-docs / minimal-mistakes later if doc volume grows.
+theme: jekyll-theme-cayman
+
+# Used by SEO + sitemap plugins (no-ops without them, harmless).
+url: https://terminalcat.anandsreekumar.com
+repository: anandsreekumaras/terminalcat
+
+# Stop Jekyll from copying these out of /docs into /_site (we don't need
+# multiple READMEs in the published site).
+exclude:
+  - README.md
+  - vendor
+
+# GitHub Pages restricts plugins to a known list — these two are safe and
+# add SEO tags + a sitemap for free.
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap

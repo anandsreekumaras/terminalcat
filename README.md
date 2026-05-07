@@ -8,6 +8,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node 20+](https://img.shields.io/badge/Node-%3E%3D20.0-success)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](https://www.typescriptlang.org/)
+[![Docs](https://img.shields.io/badge/docs-terminalcat.anandsreekumar.com-blue)](https://terminalcat.anandsreekumar.com)
+
+> 📖 **Docs:** [terminalcat.anandsreekumar.com](https://terminalcat.anandsreekumar.com) — landing + getting-started, mirroring this README.
 
 > **Status:** personal project shared in case it's useful. PRs welcome,
 > issues read as time permits, no support SLA. See [SECURITY.md](SECURITY.md)
