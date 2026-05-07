@@ -70,6 +70,16 @@ const UploadStart = z.object({
   mode: z.string().regex(/^0?[0-7]{3,4}$/).optional(),
 });
 
+// App-level ping. The WS protocol's own ping/pong frames also exist (server
+// sends them every 30s for liveness), but mobile-PWA dead-connection cases
+// sometimes need an app-level probe driven from the *client* side — e.g. on
+// visibilitychange after iOS suspended the page. Server replies with `pong`
+// echoing the client's `t` so the client can compute RTT if it wants.
+const Ping = z.object({
+  type: z.literal('ping'),
+  t: z.number().optional(),
+});
+
 export const ClientControl = z.discriminatedUnion('type', [
   Resize,
   SessionList,
@@ -80,6 +90,7 @@ export const ClientControl = z.discriminatedUnion('type', [
   SessionCwd,
   TmuxMouse,
   UploadStart,
+  Ping,
 ]);
 export type ClientControl = z.infer<typeof ClientControl>;
 

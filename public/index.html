@@ -1138,8 +1138,43 @@
       socket.onerror = () => console.error('[ws] error event');
     }
 
+    // ===== visibility-driven liveness probe ============================
+    // Mobile-PWA-specific: iOS suspends backgrounded tabs, the underlying
+    // TCP/WS may be silently severed, and the WS object stays in OPEN state
+    // for minutes before the OS notices. Server-side ws.ping() catches this
+    // within 30s, but for instant feedback on resume, send an app-level
+    // ping the moment the page becomes visible. If the pong doesn't arrive
+    // within PROBE_TIMEOUT_MS, force-close so the existing reconnect logic
+    // fires immediately instead of users seeing a frozen terminal.
+    let probeTimer = 0;
+    const PROBE_TIMEOUT_MS = 3000;
+    function probeConnection() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      clearTimeout(probeTimer);
+      try {
+        ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+      } catch { return; /* socket already gone; reconnect path will fire */ }
+      probeTimer = setTimeout(() => {
+        // Late or missing pong → connection is wedged. Force-close.
+        // The onclose handler will trigger reconnect.
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          console.warn('[ws] probe timeout; force-closing for reconnect');
+          try { ws.close(4000, 'probe-timeout'); } catch { /* ignore */ }
+        }
+      }, PROBE_TIMEOUT_MS);
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') probeConnection();
+    });
+
     function handleControl(msg) {
       switch (msg.type) {
+        case 'pong': {
+          // Liveness probe answered. Cancel the force-close timer.
+          clearTimeout(probeTimer);
+          probeTimer = 0;
+          return;
+        }
         case 'session-list': {
           const list = Array.isArray(msg.sessions) ? msg.sessions : [];
           if (list.length === 0) {

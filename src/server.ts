@@ -517,6 +517,16 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
       return;
     }
 
+    case 'ping': {
+      // Echo `t` back so the client can compute round-trip if it wants;
+      // the mere arrival of `pong` tells the client the connection is
+      // alive end-to-end through CF + tunnel + origin.
+      const reply: { type: 'pong'; t?: number } = { type: 'pong' };
+      if (typeof msg.t === 'number') reply.t = msg.t;
+      ws.send(JSON.stringify(reply));
+      return;
+    }
+
     case 'upload-start': {
       const args: Parameters<typeof startUpload>[0] = {
         sessionId: msg.sessionId,
@@ -771,6 +781,32 @@ const wss = new WebSocketServer({
 });
 const wsAuth = new WeakMap<WebSocket, { email: string; sub: string }>();
 
+// === WS-protocol keepalive ================================================
+// Standard ws-library idiom: server pings every PING_INTERVAL_MS. Browsers
+// auto-respond with pong frames. If a client misses two consecutive pings,
+// terminate — its TCP is gone (mobile NAT/CGNAT/CF tunnel idle, iOS PWA
+// background suspend, etc.) but the WS object would otherwise sit "open"
+// for minutes before the OS notices. This catches it within ~2*interval.
+//
+// Lives at protocol level so it doesn't even need a frontend code change
+// to engage on existing clients. There's also an app-level ping handler
+// above, used by the frontend's visibilitychange-driven probe for
+// faster-than-30s detection on PWA wake.
+const PING_INTERVAL_MS = 30_000;
+const wsAlive = new WeakMap<WebSocket, boolean>();
+const keepaliveTimer = setInterval(() => {
+  for (const client of wss.clients) {
+    if (wsAlive.get(client) === false) {
+      log.info(`[ws] keepalive: no pong, terminating dead connection`);
+      try { client.terminate(); } catch { /* already gone */ }
+      continue;
+    }
+    wsAlive.set(client, false);
+    try { client.ping(); } catch { /* connection closing */ }
+  }
+}, PING_INTERVAL_MS);
+keepaliveTimer.unref(); // don't block process exit on this timer
+
 // Per-connection accounting. One log line is emitted at WS close with the
 // totals — easier to grep than streaming every byte transfer to the log.
 interface WsAccount {
@@ -847,6 +883,11 @@ wss.on('connection', (ws, req) => {
     sessionsOpened: new Set(),
   });
   log.info({ ip, email }, '[ws] open');
+  // Mark as alive so the keepalive timer doesn't kill us before we've
+  // had a chance to be pinged once. Each subsequent pong flips it back
+  // to true; missed pings flip it to false and then terminate.
+  wsAlive.set(ws, true);
+  ws.on('pong', () => wsAlive.set(ws, true));
   // Tell the client who it is and where it's coming from — frontend
   // displays this in the bottom #info-bar. user/host let the bottom bar
   // render a Claude-Code-style `user@host:cwd` status line.
