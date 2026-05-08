@@ -20,7 +20,7 @@
     "pino": "^10.3.1",
     "pino-roll": "^4.0.0",
     "ws": "^8.18.0",
-    "zod": "^3.23.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
