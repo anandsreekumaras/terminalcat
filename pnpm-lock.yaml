@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       jose:
-        specifier: ^5.10.0
-        version: 5.10.0
+        specifier: ^6.2.3
+        version: 6.2.3
       node-pty:
         specifier: ^1.0.0
         version: 1.1.0
@@ -227,8 +227,8 @@ packages:
   get-tsconfig@4.14.0:
     resolution: {integrity: sha512-yTb+8DXzDREzgvYmh6s9vHsSVCHeC0G3PI5bEXNBHtmshPnO+S5O7qgLEOn0I5QvMy6kpZN8K1NKGyilLb93wA==}
 
-  jose@5.10.0:
-    resolution: {integrity: sha512-s+3Al/p9g32Iq+oqXxkW//7jk2Vig6FF1CFqzVXoTUXt2qz89YWbL+OwS17NFYEvxC35n0FKeGO2LGYSxeM2Gg==}
+  jose@6.2.3:
+    resolution: {integrity: sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw==}
 
   node-addon-api@7.1.1:
     resolution: {integrity: sha512-5m3bsyrjFWE1xf7nz7YXdN4udnVtXK6/Yfgn5qnahL6bCkf2yKt4k3nuTKAtT4r3IG8JNR2ncsIMdZuAzJjHQQ==}
@@ -439,7 +439,7 @@ snapshots:
     dependencies:
       resolve-pkg-maps: 1.0.0
 
-  jose@5.10.0: {}
+  jose@6.2.3: {}
 
   node-addon-api@7.1.1: {}
 
