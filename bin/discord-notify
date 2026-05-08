@@ -1,0 +1,140 @@
+#!/usr/bin/env node
+// discord-notify — send a message to a Discord webhook.
+//
+// Usage:
+//   discord-notify "scan complete"
+//   nuclei -l targets.txt; discord-notify "nuclei done: $?"
+//   long-running-thing | tail -5 | discord-notify
+//
+// Webhook URL is read from (in order):
+//   1. $DISCORD_WEBHOOK_URL env var
+//   2. ~/.config/discord-webhook   (single line, the URL)
+//   3. ~/.discord-webhook
+//
+// Silent no-op if no webhook is configured — safe to leave in scripts that
+// run on machines without Discord set up. Errors-out only on actual
+// network/HTTP failures.
+//
+// To set up:
+//   1. In Discord: Server Settings → Integrations → Webhooks → New Webhook
+//      → copy the URL (looks like https://discord.com/api/webhooks/.../...).
+//   2. mkdir -p ~/.config && echo 'https://discord.com/api/webhooks/...' > ~/.config/discord-webhook
+//   3. chmod 600 ~/.config/discord-webhook   # treat the URL like a secret
+
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+
+const SCRIPT = path.basename(process.argv[1]);
+const MAX_DISCORD_CONTENT = 2000;
+
+function pickWebhook() {
+  if (process.env.DISCORD_WEBHOOK_URL) {
+    return process.env.DISCORD_WEBHOOK_URL.trim();
+  }
+  const home = process.env.HOME || '';
+  const candidates = [
+    path.join(home, '.config', 'discord-webhook'),
+    path.join(home, '.discord-webhook'),
+  ];
+  for (const p of candidates) {
+    try {
+      const first = fs.readFileSync(p, 'utf8').split('\n')[0].trim();
+      if (first.startsWith('https://')) return first;
+    } catch {
+      // missing or unreadable — try next
+    }
+  }
+  return null;
+}
+
+function readMessage() {
+  const args = process.argv.slice(2);
+  if (args.length > 0) return args.join(' ');
+  // No args → read stdin (so `cmd | discord-notify` works).
+  if (process.stdin.isTTY) return null;
+  try {
+    return fs.readFileSync(0, 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+const webhook = pickWebhook();
+const msg = readMessage();
+
+if (!msg) {
+  process.stderr.write(
+    `usage: ${SCRIPT} <message>\n` +
+    `       cmd | ${SCRIPT}\n`,
+  );
+  process.exit(2);
+}
+
+if (!webhook) {
+  // Don't fail scripts that include this in long pipelines. Print only when
+  // running interactively so shell-script use is silent.
+  if (process.stderr.isTTY) {
+    process.stderr.write(
+      `${SCRIPT}: no webhook URL set. Set DISCORD_WEBHOOK_URL or write the URL to ` +
+      `~/.config/discord-webhook. Skipping.\n`,
+    );
+  }
+  process.exit(0);
+}
+
+// Discord caps `content` at 2000 chars. Truncate with a visible marker so
+// users don't silently lose the tail of their pipe output.
+const truncated = msg.length > MAX_DISCORD_CONTENT - 10
+  ? msg.slice(0, MAX_DISCORD_CONTENT - 10) + '\n…(truncated)'
+  : msg;
+const body = JSON.stringify({ content: truncated });
+
+let url;
+try {
+  url = new URL(webhook);
+} catch {
+  process.stderr.write(`${SCRIPT}: webhook URL malformed\n`);
+  process.exit(1);
+}
+
+const req = https.request(
+  {
+    hostname: url.hostname,
+    port: url.port || 443,
+    path: url.pathname + url.search,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'User-Agent': 'terminalcat-discord-notify/1.0',
+    },
+    timeout: 5_000,
+  },
+  (res) => {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      // Drain so the connection closes cleanly.
+      res.resume();
+      res.on('end', () => process.exit(0));
+    } else {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        process.stderr.write(`${SCRIPT}: HTTP ${res.statusCode}: ${data.slice(0, 200)}\n`);
+        process.exit(1);
+      });
+    }
+  },
+);
+req.on('timeout', () => {
+  req.destroy();
+  process.stderr.write(`${SCRIPT}: timed out after 5s\n`);
+  process.exit(1);
+});
+req.on('error', (e) => {
+  process.stderr.write(`${SCRIPT}: ${e.message}\n`);
+  process.exit(1);
+});
+req.write(body);
+req.end();

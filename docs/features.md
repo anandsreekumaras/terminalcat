@@ -128,6 +128,7 @@ Plus the **CSWSH defense**: optional `ALLOWED_ORIGIN` env var causes WS upgrades
 - Structured pino logs with daily rotation
 - Per-WS connection summary log line at close (bytesUp/bytesDown/durationMs/sessionsOpened)
 - `webnotify` shim — pushes a notification from inside any session to the active browser tab
+- `discord-notify` shim — direct HTTPS POST to a Discord webhook for "task done while I was away" pings (works regardless of whether a browser tab is open). See [Notifications](./notifications.html)
 
 ## What's deliberately out of scope
 

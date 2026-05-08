@@ -12,7 +12,7 @@
 #   4. pnpm install (compiles node-pty from source on aarch64)
 #   5. Prompts for Cloudflare Access env vars and writes .env
 #   6. Optionally installs the systemd unit
-#   7. Optionally symlinks webdl / webnotify into /usr/local/bin
+#   7. Optionally symlinks webdl / webnotify / discord-notify into /usr/local/bin
 #
 # One-liner install:
 #   curl -fsSL https://raw.githubusercontent.com/anandsreekumaras/terminalcat/main/scripts/install.sh | bash
@@ -499,14 +499,19 @@ ask_tunnel_systemd() {
 # ===== shims ==============================================================
 ask_shims() {
   echo
-  if ! confirm "install webdl + webnotify CLI shims to /usr/local/bin?"; then
+  if ! confirm "install webdl + webnotify + discord-notify CLI shims to /usr/local/bin?"; then
     info "skipping. You can do it later: \`sudo ln -sf $INSTALL_DIR/bin/webdl /usr/local/bin/\`"
     return
   fi
   need_sudo
-  sudo ln -sf "$INSTALL_DIR/bin/webdl"     /usr/local/bin/webdl
-  sudo ln -sf "$INSTALL_DIR/bin/webnotify" /usr/local/bin/webnotify
-  ok "webdl + webnotify symlinked into /usr/local/bin"
+  sudo ln -sf "$INSTALL_DIR/bin/webdl"          /usr/local/bin/webdl
+  sudo ln -sf "$INSTALL_DIR/bin/webnotify"      /usr/local/bin/webnotify
+  sudo ln -sf "$INSTALL_DIR/bin/discord-notify" /usr/local/bin/discord-notify
+  ok "webdl + webnotify + discord-notify symlinked into /usr/local/bin"
+  if ! [ -f "$HOME/.config/discord-webhook" ] && [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
+    info "↳ discord-notify is silent until you configure a webhook URL. To enable:"
+    info "    mkdir -p ~/.config && echo 'https://discord.com/api/webhooks/...' > ~/.config/discord-webhook && chmod 600 ~/.config/discord-webhook"
+  fi
 }
 
 # ===== summary ============================================================

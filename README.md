@@ -410,7 +410,9 @@ adjust font size (10–24 px, persisted in `localStorage`).
 - **File download**: from inside any tab,
   `webdl /path/to/file` — file streams to your browser as a download.
   Requires the shim symlinked in PATH (the installer offers this).
-- **Notifications**: `webnotify "scan finished"` — pings the active
+- **Notifications**:
+  - `discord-notify "scan finished"` — POSTs to a configured Discord webhook (works whether or not a browser tab is open; webhook URL in `~/.config/discord-webhook` or `$DISCORD_WEBHOOK_URL`). Pipe-friendly: `cmd | tail -5 | discord-notify`.
+  - `webnotify "scan finished"` — pings the active
   browser tab; if the page is backgrounded, a real OS notification fires
   (browser permission required, asked on first interaction).
 - **Detached sessions**: appear as chips in the bottom bar above the
