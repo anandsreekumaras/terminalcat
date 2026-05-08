@@ -410,14 +410,52 @@ function injectStatus(sessionId: string, text: string): void {
   broadcastToSubscribers(sessionId, frame);
 }
 
+// Backpressure guards. ws.bufferedAmount is the size in bytes of frames
+// queued for send but not yet flushed to the kernel. Under healthy
+// network + a responsive client it sits at ~0; under iOS PWA background
+// suspension or a slow link it grows unboundedly because we have nothing
+// to push back against. Two thresholds, both per-WS:
+//
+//   SOFT (4 MB) — start DROPPING this WS's PTY-output frames. tmux still
+//                  has the canonical state, so on next reconnect the
+//                  client's xterm gets repainted from there. Worst-case
+//                  user-visible effect: a brief gap in scrollback during
+//                  the slow period.
+//   HARD (16 MB) — close the connection. Connection is effectively dead;
+//                  forcing close lets the client's existing reconnect
+//                  logic kick in (1 s backoff → fresh TCP), instead of
+//                  sitting wedged forever waiting on a kernel-level
+//                  flush that's never going to come.
+const BACKPRESSURE_SOFT_BYTES = 4 * 1024 * 1024;
+const BACKPRESSURE_HARD_BYTES = 16 * 1024 * 1024;
+// Per-WS warn-rate limiting: log only the first drop in any 30 s window
+// per connection so we don't fill journal with one line per dropped chunk.
+const lastBackpressureWarnAt = new WeakMap<WebSocket, number>();
+
 function broadcastToSubscribers(id: string, frame: Buffer): void {
   const a = active.get(id);
   if (!a) return;
   for (const ws of a.subscribers) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(frame);
-      bumpDown(ws, frame.length);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    const buf = ws.bufferedAmount;
+    if (buf >= BACKPRESSURE_HARD_BYTES) {
+      // Connection is wedged. Force-close so the client's reconnect path
+      // fires immediately instead of waiting on the keepalive 30-60 s.
+      log.warn({ session: id, buffered: buf }, '[ws] hard backpressure, terminating');
+      try { ws.terminate(); } catch { /* already gone */ }
+      continue;
     }
+    if (buf >= BACKPRESSURE_SOFT_BYTES) {
+      const now = Date.now();
+      const last = lastBackpressureWarnAt.get(ws) ?? 0;
+      if (now - last > 30_000) {
+        lastBackpressureWarnAt.set(ws, now);
+        log.warn({ session: id, buffered: buf }, '[ws] soft backpressure, dropping output frame');
+      }
+      continue;
+    }
+    ws.send(frame);
+    bumpDown(ws, frame.length);
   }
 }
 
