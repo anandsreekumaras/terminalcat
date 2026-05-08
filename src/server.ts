@@ -287,8 +287,35 @@ interface ActivePty {
   pty: pty.IPty;
   /** Subscribers currently receiving STDOUT frames for this session. */
   subscribers: Set<WebSocket>;
+  /**
+   * Each subscriber's last-announced viewport size. The PTY is sized to
+   * the smallest cols + rows across all of them, mirroring tmux's
+   * multi-client behaviour. Without this, a small mobile client and a
+   * large desktop client attached to the same session would oscillate
+   * the PTY size every time either fired a resize control message —
+   * tmux re-paints the whole screen on every resize, which the user
+   * sees as flicker.
+   */
+  subscriberSizes: Map<WebSocket, { cols: number; rows: number }>;
 }
 const active = new Map<string, ActivePty>();
+
+// Compute the effective (smallest-wins) PTY size across an entry's
+// subscribers. Returns null if no subscriber has reported a size yet
+// (e.g. brand-new attachment hasn't sent its first resize) — caller
+// should leave the PTY unchanged.
+function effectiveSizeFor(a: ActivePty): { cols: number; rows: number } | null {
+  let cols = Infinity;
+  let rows = Infinity;
+  for (const sub of a.subscribers) {
+    const s = a.subscriberSizes.get(sub);
+    if (!s) continue;
+    if (s.cols < cols) cols = s.cols;
+    if (s.rows < rows) rows = s.rows;
+  }
+  if (!Number.isFinite(cols) || !Number.isFinite(rows)) return null;
+  return { cols, rows };
+}
 
 // === stdout output batching (opt-in) ======================================
 // Per-session pending buffer + flush timer. If OUTPUT_BATCH_MS > 0, stdout
@@ -418,7 +445,12 @@ function attachWsToSession(ws: WebSocket, id: string): void {
   if (!a) {
     // First subscriber — spawn the PTY child and wire it up.
     const child = spawnPtyForSession(id, 80, 24, PTY_ENV, PTY_CWD);
-    const entry: ActivePty = { id, pty: child, subscribers: new Set() };
+    const entry: ActivePty = {
+      id,
+      pty: child,
+      subscribers: new Set(),
+      subscriberSizes: new Map(),
+    };
     a = entry;
     active.set(id, a);
     log.info(`[pty] session=${id} spawned client pid=${child.pid}`);
@@ -466,9 +498,20 @@ function detachWsFromSession(ws: WebSocket, id: string, reason = 'detached'): vo
     return;
   }
   a.subscribers.delete(ws);
+  a.subscriberSizes.delete(ws);
   getSubs(ws).delete(id);
   // Tell remaining subscribers (if any) the count just dropped.
   if (a.subscribers.size > 0) broadcastClientCount(id);
+  // Re-compute the smallest-wins PTY size now that this subscriber's
+  // dimensions are out of the picture. If a small mobile client just
+  // detached and only a big desktop client remains, the PTY can grow
+  // back to the desktop's size (one resize, no flicker).
+  if (a.subscribers.size > 0) {
+    const eff = effectiveSizeFor(a);
+    if (eff && eff.cols >= 2 && eff.rows >= 2 && eff.cols <= 1000 && eff.rows <= 1000) {
+      a.pty.resize(eff.cols, eff.rows);
+    }
+  }
   if (a.subscribers.size === 0) {
     // No more clients want this session: SIGHUP our PTY child (which is the
     // tmux *client*; the tmux *server* and the session itself live on).
@@ -573,8 +616,27 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
     case 'resize': {
       const a = active.get(msg.sessionId);
       if (!a) return;
-      a.pty.resize(msg.cols, msg.rows);
-      log.debug({ session: msg.sessionId, cols: msg.cols, rows: msg.rows }, '[ctrl] resize');
+      // Defense: only attached subscribers may resize.
+      if (!a.subscribers.has(ws)) {
+        log.warn({ session: msg.sessionId }, '[ctrl] resize from non-subscriber, dropped');
+        return;
+      }
+      // Record this subscriber's viewport size, then resize the PTY to
+      // the smallest cols/rows across all current subscribers. With
+      // multiple devices attached to one session, last-resize-wins
+      // would oscillate the PTY between device dims and tmux would
+      // re-paint on every change, causing visible flicker. Smallest-
+      // wins gives a stable size: the small device sees content
+      // correctly, the bigger device gets letterbox space.
+      a.subscriberSizes.set(ws, { cols: msg.cols, rows: msg.rows });
+      const eff = effectiveSizeFor(a);
+      if (eff && eff.cols >= 2 && eff.rows >= 2 && eff.cols <= 1000 && eff.rows <= 1000) {
+        a.pty.resize(eff.cols, eff.rows);
+      }
+      log.debug(
+        { session: msg.sessionId, cols: msg.cols, rows: msg.rows, eff },
+        '[ctrl] resize',
+      );
       return;
     }
 
