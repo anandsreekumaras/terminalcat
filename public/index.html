@@ -185,10 +185,15 @@
       user-select: text;
     }
     .xterm, .xterm-viewport, .xterm-screen { height: 100%; }
-    /* Allow vertical pan for touch scroll inside the terminal viewport.
-       Body has touch-action: manipulation (no pinch-zoom); this overrides
-       so swipes scroll the terminal/tmux scrollback. */
-    .xterm-viewport { touch-action: pan-y !important; }
+    /* `touch-action: none` on the terminal area: the browser does NOTHING
+       on touch — no native scroll, no pinch-zoom, no rubber-band drag.
+       The swipe handler in JS (look for SWIPE_ROW_PX) and the pinch-zoom
+       handler in JS own all gestures. Without this, vertical swipes bubble
+       up as page drags ("the whole window gets pulled when I scroll inside
+       Claude Code") because the browser tries to pan-y first while the JS
+       handler is still accumulating the 24-px swipe threshold.
+       overscroll-behavior:contain on body already kills pull-to-refresh. */
+    .xterm, .xterm-viewport, .xterm-screen { touch-action: none !important; }
 
     /* ===== helper bar (bottom) ========================================== */
     #helper-bar {
