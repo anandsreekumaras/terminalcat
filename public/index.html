@@ -1508,6 +1508,64 @@
       if (e.touches.length < 2) pinchStart = 0;
     }, { passive: true });
 
+    // ===== one-finger vertical swipe → scroll ============================
+    // Mobile-only fix: when the inner app captures the mouse (tmux mouse
+    // mode + a TUI like Claude Code / vim / htop in the alternate screen
+    // buffer), touch swipes get eaten by the app's mouse-handler and the
+    // viewport never scrolls. Convert vertical swipes to:
+    //   - arrow keys when the buffer is alternate (TUIs scroll on arrows)
+    //   - xterm scrollback when the buffer is normal (plain shell history)
+    // Long-press menu and pinch-zoom keep working — long-press cancels at
+    // 10px movement (handled above), pinch only fires on 2-finger touch,
+    // so this 1-finger >24px-delta path is unambiguous.
+    let swipeStartY = null;
+    let swipeStartX = null;
+    let swipeLastEmitY = null;
+    const SWIPE_ROW_PX = 24; // emit one row per ~24px of finger travel
+    panes.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        swipeStartY = e.touches[0].clientY;
+        swipeStartX = e.touches[0].clientX;
+        swipeLastEmitY = swipeStartY;
+      } else {
+        swipeStartY = null;
+      }
+    }, { passive: true });
+    panes.addEventListener('touchmove', (e) => {
+      if (swipeStartY == null || e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      const x = e.touches[0].clientX;
+      const dyTotal = y - swipeStartY;
+      const dxTotal = x - swipeStartX;
+      // Only hijack mostly-vertical swipes — diagonal/horizontal goes
+      // through to xterm normally (e.g. for selection drag).
+      if (Math.abs(dyTotal) < Math.abs(dxTotal)) return;
+      const dy = y - swipeLastEmitY;
+      if (Math.abs(dy) < SWIPE_ROW_PX) return;
+      const rows = Math.trunc(dy / SWIPE_ROW_PX);
+      swipeLastEmitY = y;
+      const cs = currentSession();
+      if (!cs) return;
+      const inAltScreen = cs.term.buffer.active.type === 'alternate';
+      if (inAltScreen) {
+        // Swipe DOWN with finger = wanting to see content ABOVE current view.
+        // In line-oriented TUIs, that's arrow UP. Swipe up = arrow down.
+        const seq = dy > 0 ? '\x1b[A' : '\x1b[B';
+        sendStdin(activeId, seq.repeat(Math.abs(rows)));
+      } else {
+        // Plain shell: scroll xterm's own scrollback. negative = scroll back.
+        cs.term.scrollLines(-rows);
+      }
+      // Suppress mouse-event synthesis so the swipe doesn't ALSO drag-select
+      // text in xterm. (Long-press handler already self-cancelled at 10px.)
+      e.preventDefault();
+    }, { passive: false });
+    panes.addEventListener('touchend', () => {
+      swipeStartY = null;
+      swipeStartX = null;
+      swipeLastEmitY = null;
+    }, { passive: true });
+
     // ===== helper bar (sticky modifiers) =================================
     const sticky = { ctrl: false, alt: false };
     function paintSticky() {
