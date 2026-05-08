@@ -23,8 +23,12 @@ updates:
       prefix: deps
       include: scope
     groups:
-      # Cluster runtime libs together so they update in a single PR
-      # instead of seven simultaneous tiny ones.
+      # Cluster minor+patch bumps together so they update in a single PR
+      # instead of seven simultaneous tiny ones. MAJOR bumps are
+      # explicitly excluded from the group — they come as their own PR
+      # so each can be reviewed against its changelog one at a time
+      # (e.g., jose 5→6 dropped the Node CJS build; zod 3→4 is an API
+      # rewrite — both should NOT be grouped with patch bumps).
       runtime:
         patterns:
           - "node-pty"
@@ -33,13 +37,22 @@ updates:
           - "zod"
           - "pino"
           - "pino-roll"
+        update-types:
+          - "minor"
+          - "patch"
       types:
         patterns:
           - "@types/*"
+        update-types:
+          - "minor"
+          - "patch"
       tooling:
         patterns:
           - "tsx"
           - "typescript"
+        update-types:
+          - "minor"
+          - "patch"
 
   # GitHub Actions versions in any workflow YAMLs we add later
   - package-ecosystem: github-actions
