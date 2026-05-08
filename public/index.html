@@ -1646,14 +1646,52 @@
       helperBar.style.bottom = '';
       cs?.fit.fit();
     }
-    if (window.visualViewport) {
-      window.visualViewport.addEventListener('resize', applyViewport);
-      window.visualViewport.addEventListener('scroll', applyViewport);
+    // rAF-coalesce visualViewport + window-resize events.
+    //
+    // Why this matters on mobile: when the iOS keyboard slides up, vv
+    // fires `resize` and `scroll` events many times in a 250 ms animation
+    // window — each one would otherwise call `applyViewport()` synchronously,
+    // and applyViewport calls `fit.fit()`, which forces a layout pass +
+    // xterm reflow + WS resize message. Without coalescing that's 5–8
+    // redundant reflows per keyboard appearance — visibly janky on weaker
+    // phones.
+    //
+    // With rAF coalescing: at most one applyViewport per animation frame.
+    let vvScheduled = false;
+    function scheduleViewport() {
+      if (vvScheduled) return;
+      vvScheduled = true;
+      requestAnimationFrame(() => {
+        vvScheduled = false;
+        applyViewport();
+      });
     }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', scheduleViewport);
+      window.visualViewport.addEventListener('scroll', scheduleViewport);
+    }
+    let resizeScheduled = false;
     window.addEventListener('resize', () => {
-      // Every tab needs a refit so it's ready when shown.
-      for (const t of tabs.values()) t.session?.fit.fit();
-      applyViewport();
+      if (resizeScheduled) return;
+      resizeScheduled = true;
+      requestAnimationFrame(() => {
+        resizeScheduled = false;
+        // Every tab needs a refit so it's ready when shown.
+        for (const t of tabs.values()) t.session?.fit.fit();
+        applyViewport();
+      });
+    });
+
+    // Battery + render-cost saver: pause cursor blink while the page is
+    // hidden (locked phone, app-switched away, PWA backgrounded). Cursor
+    // blink keeps the renderer awake at 1 Hz; turning it off lets the
+    // GPU idle. Restore on visible. Cheap to flip; xterm picks it up
+    // on the next render tick.
+    document.addEventListener('visibilitychange', () => {
+      const hidden = document.visibilityState === 'hidden';
+      for (const t of tabs.values()) {
+        if (t.session) t.session.term.options.cursorBlink = !hidden;
+      }
     });
 
     // Keyboard shortcuts for select-all / copy / paste / search are
