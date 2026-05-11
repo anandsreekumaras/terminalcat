@@ -136,7 +136,24 @@
       background: transparent;
       flex-shrink: 0;
     }
-    .tab.has-activity:not(.active) .tab-status { background: #9ece6a; }
+    /* Background-tab activity: gentle breathe to draw the eye without
+       being a flashy "you must look here right now" attention-grab.
+       1.6s cycle is slow enough that it doesn't pulse-spam during heavy
+       streaming output. Uses transform+opacity only (GPU-composited;
+       zero layout impact). */
+    @keyframes tc-activity-pulse {
+      0%, 100% { transform: scale(1);    opacity: 1; }
+      50%      { transform: scale(1.25); opacity: 0.65; }
+    }
+    .tab.has-activity:not(.active) .tab-status {
+      background: #9ece6a;
+      animation: tc-activity-pulse 1.6s ease-in-out infinite;
+    }
+    /* Respect prefers-reduced-motion — system-level "kill the animations"
+       toggle that screen-readers + a11y settings turn on. */
+    @media (prefers-reduced-motion: reduce) {
+      .tab.has-activity:not(.active) .tab-status { animation: none; }
+    }
     .tab.dormant .tab-title { color: #6a7088; font-style: italic; }
 
     .tab-add {
@@ -164,7 +181,22 @@
       box-sizing: border-box;
       display: none;
     }
-    .pane.active { display: block; }
+    /* Light fade-in when a tab becomes active. 120 ms is fast enough that
+       it doesn't feel like waiting; slow enough to register as "this is
+       the new tab, not a redraw glitch". One-shot keyframe — doesn't
+       loop or recompute on subsequent renders, no GPU cost beyond the
+       initial frame. */
+    .pane.active {
+      display: block;
+      animation: tc-pane-in 120ms ease-out;
+    }
+    @keyframes tc-pane-in {
+      from { opacity: 0.4; }
+      to   { opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .pane.active { animation: none; }
+    }
     .pane-empty {
       position: absolute;
       inset: 0;
@@ -286,20 +318,31 @@
     #action-sheet-overlay.open { opacity: 1; pointer-events: auto; }
 
     /* ===== reconnect banner ============================================ */
+    /* Slides down from above-viewport when network drops, springs back up
+       when it recovers. Avoids the "did the banner just blink in?" hard
+       cut. translateY is GPU-composited so no layout cost. */
     #conn-status {
       position: fixed;
       top: calc(var(--safe-top) + 4px);
       left: 50%;
-      transform: translateX(-50%);
+      transform: translate(-50%, -150%);
       padding: 6px 12px;
       background: rgba(247, 118, 142, 0.92);
       color: #15161e;
       border-radius: 14px;
       font: 12px ui-monospace, monospace;
       z-index: 110;
-      display: none;
+      opacity: 0;
+      pointer-events: none;
+      transition: transform 180ms cubic-bezier(.2, .9, .3, 1), opacity 180ms ease-out;
     }
-    #conn-status.show { display: block; }
+    #conn-status.show {
+      transform: translate(-50%, 0);
+      opacity: 1;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #conn-status { transition: none; }
+    }
 
     /* ===== transfer cards (uploads + downloads) ======================== */
     #transfers {
@@ -873,15 +916,14 @@
           theme: THEME,
           scrollback: SCROLLBACK,
           allowProposedApi: true,
-          // Defaults left at 1 / 5. Previous bump to 3 / 8 (intended to cut
-          // round-trip count for slow corp-network scrolling) made plain-
-          // shell + tmux-mouse-mode scrolling visibly chunky — each wheel
-          // detent fires 3 wheel sequences to tmux, which scrolls in 3-line
-          // jumps rather than smoothly. The lag on slow networks is real
-          // but reducing wheel-events at the cost of UX everywhere else
-          // wasn't worth it. Microtask frame-coalescing on the server
-          // (see emitStdout in src/server.ts) gives most of the same
-          // bandwidth saving without touching scroll feel.
+          // Adds a brief easing to scrollback wheel scrolls — turns the
+          // hard-cut "line jumps up" into a 100 ms smooth transition. Only
+          // affects xterm's OWN scrollback view (when mouse mode is off,
+          // or when scrolling above the live region); does NOT slow down
+          // live output rendering, keystroke echo, or TUI redraws. Default
+          // is 0 (instant); 100 is enough to feel fluid without registering
+          // as "the terminal got slow".
+          smoothScrollDuration: 100,
         });
         this.fit = new FitAddon.FitAddon();
         this.term.loadAddon(this.fit);
