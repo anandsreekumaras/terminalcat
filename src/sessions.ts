@@ -168,6 +168,38 @@ export function keepTmuxSelectionAfterDrag(): Promise<void> {
  *      and calls `navigator.clipboard.writeText`. Only works in a
  *      user-gesture context — the mouse-drag-end IS one.
  */
+/**
+ * One-line-per-wheel-tick scrolling in copy-mode.
+ *
+ * tmux's default copy-mode wheel bindings scroll FIVE lines per wheel tick
+ * (`send-keys -X -N 5 scroll-up`). On a precision wheel / trackpad detent,
+ * that feels like the scroll position jumps "+5" or "-5" lines at a time
+ * instead of moving smoothly with the user's wheel. Rebind to scroll
+ * exactly one line per wheel tick.
+ *
+ * Applied in both `copy-mode` (emacs-style, our default mode-keys) and
+ * `copy-mode-vi`, so the binding takes regardless of which the user
+ * has set via mode-keys.
+ */
+export function setTmuxScrollStepOne(): Promise<void> {
+  const tables = ['copy-mode', 'copy-mode-vi'];
+  const tasks: string[][] = [];
+  for (const t of tables) {
+    // -N 1 is technically redundant (scroll-up defaults to 1 line when
+    // count is unspecified) but explicit > implicit when overriding a
+    // default that was explicit in the other direction.
+    tasks.push(['bind-key', '-T', t, 'WheelUpPane',   'select-pane', '\\;', 'send-keys', '-X', '-N', '1', 'scroll-up']);
+    tasks.push(['bind-key', '-T', t, 'WheelDownPane', 'select-pane', '\\;', 'send-keys', '-X', '-N', '1', 'scroll-down']);
+  }
+  return Promise.all(tasks.map((args) => new Promise<void>((resolve) => {
+    const child = spawn('tmux', args);
+    child.on('error', () => resolve());
+    child.on('close', () => resolve());
+  }))).then(() => {
+    console.log('[tmux] copy-mode wheel: 1 line per tick (was 5)');
+  });
+}
+
 export function enableTmuxClipboard(): Promise<void> {
   const cmds: string[][] = [
     ['set-option', '-g', 'set-clipboard', 'on'],

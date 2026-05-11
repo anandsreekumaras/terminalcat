@@ -50,6 +50,7 @@ import {
   disableTmuxRightClickMenu,
   keepTmuxSelectionAfterDrag,
   enableTmuxClipboard,
+  setTmuxScrollStepOne,
   type SessionInfo,
 } from './sessions';
 import {
@@ -1179,6 +1180,9 @@ server.listen(PORT, HOST, () => {
   // frontend, which can show client IP / device count / etc. that tmux
   // doesn't know about.
   void disableTmuxStatus();
+  // Wheel-tick in copy-mode scrolls 1 line, not tmux's default 5. Stops
+  // the "+5/-5 jump" feel when scrolling through scrollback.
+  void setTmuxScrollStepOne();
 });
 
 // === shim socket (webdl / webnotify) =====================================
