@@ -873,14 +873,15 @@
           theme: THEME,
           scrollback: SCROLLBACK,
           allowProposedApi: true,
-          // Each scroll-wheel tick moves 3 lines instead of 1. Macbook
-          // trackpads can fire 60+ wheel events/sec; in mouse-mode each
-          // event is a full server round-trip (xterm → ws → tmux → TUI →
-          // redraw → back). 3× the per-tick movement → ~1/3 the wheel
-          // events for the same scroll distance, and a much less laggy
-          // feel through Claude Code's conversation pane.
-          scrollSensitivity: 3,
-          fastScrollSensitivity: 8,
+          // Defaults left at 1 / 5. Previous bump to 3 / 8 (intended to cut
+          // round-trip count for slow corp-network scrolling) made plain-
+          // shell + tmux-mouse-mode scrolling visibly chunky — each wheel
+          // detent fires 3 wheel sequences to tmux, which scrolls in 3-line
+          // jumps rather than smoothly. The lag on slow networks is real
+          // but reducing wheel-events at the cost of UX everywhere else
+          // wasn't worth it. Microtask frame-coalescing on the server
+          // (see emitStdout in src/server.ts) gives most of the same
+          // bandwidth saving without touching scroll feel.
         });
         this.fit = new FitAddon.FitAddon();
         this.term.loadAddon(this.fit);
@@ -1522,62 +1523,69 @@
     }, { passive: true });
 
     // ===== one-finger vertical swipe → scroll ============================
-    // Mobile-only fix: when the inner app captures the mouse (tmux mouse
-    // mode + a TUI like Claude Code / vim / htop in the alternate screen
-    // buffer), touch swipes get eaten by the app's mouse-handler and the
-    // viewport never scrolls. Convert vertical swipes to:
+    // Touch-primary devices only (phones / tablets). DESKTOP MUST OPT OUT —
+    // macOS Chrome/Safari fire synthetic touch events for trackpad gestures,
+    // and intercepting those breaks mouse-drag-select on the laptop (the
+    // single-finger trackpad drag a user makes to highlight text turns
+    // into a swipe-to-arrow-key dispatch instead of reaching xterm).
+    //
+    // `pointer: coarse` is true on real touch hardware (phone, tablet,
+    // touch-screen-only laptop), false on pointer-precise devices (mouse,
+    // trackpad-as-primary, stylus). That's the right gate.
+    //
+    // What this handler does on mobile: when the inner app captures the
+    // mouse (tmux mouse mode + a TUI like Claude Code / vim / htop in the
+    // alternate screen buffer), touch swipes would get eaten by the app's
+    // mouse-handler and the viewport never scrolls. Convert vertical
+    // swipes to:
     //   - arrow keys when the buffer is alternate (TUIs scroll on arrows)
     //   - xterm scrollback when the buffer is normal (plain shell history)
     // Long-press menu and pinch-zoom keep working — long-press cancels at
     // 10px movement (handled above), pinch only fires on 2-finger touch,
     // so this 1-finger >24px-delta path is unambiguous.
-    let swipeStartY = null;
-    let swipeStartX = null;
-    let swipeLastEmitY = null;
-    const SWIPE_ROW_PX = 24; // emit one row per ~24px of finger travel
-    panes.addEventListener('touchstart', (e) => {
-      if (e.touches.length === 1) {
-        swipeStartY = e.touches[0].clientY;
-        swipeStartX = e.touches[0].clientX;
-        swipeLastEmitY = swipeStartY;
-      } else {
+    const IS_TOUCH_PRIMARY = window.matchMedia('(pointer: coarse)').matches;
+    if (IS_TOUCH_PRIMARY) {
+      let swipeStartY = null;
+      let swipeStartX = null;
+      let swipeLastEmitY = null;
+      const SWIPE_ROW_PX = 24; // emit one row per ~24px of finger travel
+      panes.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 1) {
+          swipeStartY = e.touches[0].clientY;
+          swipeStartX = e.touches[0].clientX;
+          swipeLastEmitY = swipeStartY;
+        } else {
+          swipeStartY = null;
+        }
+      }, { passive: true });
+      panes.addEventListener('touchmove', (e) => {
+        if (swipeStartY == null || e.touches.length !== 1) return;
+        const y = e.touches[0].clientY;
+        const x = e.touches[0].clientX;
+        const dyTotal = y - swipeStartY;
+        const dxTotal = x - swipeStartX;
+        if (Math.abs(dyTotal) < Math.abs(dxTotal)) return;
+        const dy = y - swipeLastEmitY;
+        if (Math.abs(dy) < SWIPE_ROW_PX) return;
+        const rows = Math.trunc(dy / SWIPE_ROW_PX);
+        swipeLastEmitY = y;
+        const cs = currentSession();
+        if (!cs) return;
+        const inAltScreen = cs.term.buffer.active.type === 'alternate';
+        if (inAltScreen) {
+          const seq = dy > 0 ? '\x1b[A' : '\x1b[B';
+          sendStdin(activeId, seq.repeat(Math.abs(rows)));
+        } else {
+          cs.term.scrollLines(-rows);
+        }
+        e.preventDefault();
+      }, { passive: false });
+      panes.addEventListener('touchend', () => {
         swipeStartY = null;
-      }
-    }, { passive: true });
-    panes.addEventListener('touchmove', (e) => {
-      if (swipeStartY == null || e.touches.length !== 1) return;
-      const y = e.touches[0].clientY;
-      const x = e.touches[0].clientX;
-      const dyTotal = y - swipeStartY;
-      const dxTotal = x - swipeStartX;
-      // Only hijack mostly-vertical swipes — diagonal/horizontal goes
-      // through to xterm normally (e.g. for selection drag).
-      if (Math.abs(dyTotal) < Math.abs(dxTotal)) return;
-      const dy = y - swipeLastEmitY;
-      if (Math.abs(dy) < SWIPE_ROW_PX) return;
-      const rows = Math.trunc(dy / SWIPE_ROW_PX);
-      swipeLastEmitY = y;
-      const cs = currentSession();
-      if (!cs) return;
-      const inAltScreen = cs.term.buffer.active.type === 'alternate';
-      if (inAltScreen) {
-        // Swipe DOWN with finger = wanting to see content ABOVE current view.
-        // In line-oriented TUIs, that's arrow UP. Swipe up = arrow down.
-        const seq = dy > 0 ? '\x1b[A' : '\x1b[B';
-        sendStdin(activeId, seq.repeat(Math.abs(rows)));
-      } else {
-        // Plain shell: scroll xterm's own scrollback. negative = scroll back.
-        cs.term.scrollLines(-rows);
-      }
-      // Suppress mouse-event synthesis so the swipe doesn't ALSO drag-select
-      // text in xterm. (Long-press handler already self-cancelled at 10px.)
-      e.preventDefault();
-    }, { passive: false });
-    panes.addEventListener('touchend', () => {
-      swipeStartY = null;
-      swipeStartX = null;
-      swipeLastEmitY = null;
-    }, { passive: true });
+        swipeStartX = null;
+        swipeLastEmitY = null;
+      }, { passive: true });
+    }
 
     // ===== helper bar (sticky modifiers) =================================
     const sticky = { ctrl: false, alt: false };
