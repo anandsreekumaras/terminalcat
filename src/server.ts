@@ -252,6 +252,96 @@ function clientIp(req: http.IncomingMessage): string {
   return req.socket.remoteAddress ?? '?';
 }
 
+// === web preview proxy ====================================================
+// `/preview/<port>/<rest>` proxies through to `127.0.0.1:<port>/<rest>` so
+// the user can hit dev servers running on the box (Vite, python -m http.server,
+// API endpoints) from the same authed front door, without setting up
+// additional cloudflared tunnels. Modelled on Google Cloud Shell's
+// "Web Preview" feature.
+//
+// Auth: the existing JWT gate runs before this — so only the legitimate
+// user can probe local ports. Port range capped at 1024-65535 to skip
+// privileged ports the user can't be running anyway (and to avoid
+// accidental localhost-only-services like cloudflared metrics).
+//
+// Auth headers (Cf-Access-Jwt-Assertion, Cf-Connecting-Ip, Cookie) are
+// STRIPPED before forwarding upstream — the dev server has no business
+// seeing those, and a misbehaving dev server logging headers shouldn't
+// echo the JWT into its access log.
+//
+// Limitation: HTTP only in v1. WebSocket upgrades to /preview/<port>/...
+// (e.g. Vite HMR) aren't proxied yet — see the 'upgrade' handler below
+// where it's still routed only to the WS terminal multiplexer.
+const PREVIEW_RE = /^\/preview\/(\d+)(\/.*)?$/;
+
+function isPreviewablePort(p: number): boolean {
+  return Number.isInteger(p) && p >= 1024 && p <= 65535;
+}
+
+const STRIPPED_HEADERS_TO_UPSTREAM = new Set([
+  'cf-access-jwt-assertion',
+  'cf-connecting-ip',
+  'cookie',
+  'cf-ray',
+  'cf-ipcountry',
+  'cf-visitor',
+  // Host gets rewritten below; don't forward the public hostname.
+  'host',
+]);
+
+function proxyPreview(req: http.IncomingMessage, res: http.ServerResponse, port: number, upstreamPath: string): void {
+  const upstreamHeaders: http.OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (!STRIPPED_HEADERS_TO_UPSTREAM.has(k.toLowerCase()) && v !== undefined) {
+      upstreamHeaders[k] = v;
+    }
+  }
+  upstreamHeaders['host'] = `127.0.0.1:${port}`;
+  // Tell the dev server who's actually making the request (for logging).
+  // The real client IP came in via Cf-Connecting-Ip which we stripped, so
+  // we substitute it back here under the standard header name.
+  const cf = req.headers['cf-connecting-ip'];
+  if (typeof cf === 'string') {
+    upstreamHeaders['x-forwarded-for'] = cf;
+    upstreamHeaders['x-real-ip'] = cf;
+  }
+  upstreamHeaders['x-forwarded-proto'] = 'https';
+  upstreamHeaders['x-forwarded-host'] = String(req.headers['host'] ?? '');
+
+  const upstreamReq = http.request(
+    {
+      host: '127.0.0.1',
+      port,
+      method: req.method,
+      path: upstreamPath,
+      headers: upstreamHeaders,
+      timeout: 30_000,
+    },
+    (upstreamRes) => {
+      // Forward status + headers as-is. The dev server's redirects with
+      // absolute Location headers will be slightly broken (pointing at
+      // 127.0.0.1:<port> instead of our public host) — known limitation,
+      // most dev servers emit relative redirects so this rarely surfaces.
+      res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers as http.OutgoingHttpHeaders);
+      upstreamRes.pipe(res);
+    },
+  );
+  upstreamReq.on('error', (err) => {
+    log.warn({ port, err: err.message }, '[preview] upstream error');
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+      res.end(`Web Preview: couldn't connect to 127.0.0.1:${port}\n${err.message}\n`);
+    } else {
+      res.end();
+    }
+  });
+  upstreamReq.on('timeout', () => {
+    upstreamReq.destroy(new Error('upstream timeout'));
+  });
+  // Stream request body upstream (POST / PUT / etc.).
+  req.pipe(upstreamReq);
+}
+
 const server = http.createServer((req, res) => {
   authenticateRequest(req).then((result) => {
     if (!result.ok) {
@@ -260,6 +350,20 @@ const server = http.createServer((req, res) => {
       );
       res.writeHead(401, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
       res.end('unauthorized\n');
+      return;
+    }
+    // Preview-proxy path runs before the static handler. Auth has passed.
+    const url = req.url ?? '/';
+    const m = url.match(PREVIEW_RE);
+    if (m) {
+      const port = parseInt(m[1] ?? '', 10);
+      if (!isPreviewablePort(port)) {
+        res.writeHead(400, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+        res.end(`Web Preview: port must be 1024–65535, got ${m[1]}\n`);
+        return;
+      }
+      const upstreamPath = m[2] ?? '/';
+      proxyPreview(req, res, port, upstreamPath);
       return;
     }
     serveStatic(req, res);
