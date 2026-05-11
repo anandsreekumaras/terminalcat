@@ -873,6 +873,14 @@
           theme: THEME,
           scrollback: SCROLLBACK,
           allowProposedApi: true,
+          // Each scroll-wheel tick moves 3 lines instead of 1. Macbook
+          // trackpads can fire 60+ wheel events/sec; in mouse-mode each
+          // event is a full server round-trip (xterm → ws → tmux → TUI →
+          // redraw → back). 3× the per-tick movement → ~1/3 the wheel
+          // events for the same scroll distance, and a much less laggy
+          // feel through Claude Code's conversation pane.
+          scrollSensitivity: 3,
+          fastScrollSensitivity: 8,
         });
         this.fit = new FitAddon.FitAddon();
         this.term.loadAddon(this.fit);
