@@ -22,18 +22,30 @@ updates:
     commit-message:
       prefix: deps
       include: scope
-    # Deliberate holds — runtime libs we're consciously NOT chasing the
-    # major release of. Dependabot won't refile these every week. Remove
-    # the entry when you're ready to do the upgrade work.
-    #   - jose 5 -> 6: jose 6 dropped the explicit Node CJS build; we
-    #                  rely on it via tsconfig module=commonjs.
-    #   - zod  3 -> 4: zod 4 has API breakage across z.discriminatedUnion,
-    #                  z.refine, error formatting. Schema rewrite needed.
+    # Deliberate holds — libs we're consciously NOT chasing the major
+    # release of. Dependabot won't refile these every week. Remove the
+    # entry when you're ready to do the upgrade work.
+    #   - jose 5 -> 6:         jose 6 dropped the explicit Node CJS
+    #                          build; we rely on it via tsconfig
+    #                          module=commonjs.
+    #   - zod  3 -> 4:         zod 4 has API breakage across
+    #                          z.discriminatedUnion, z.refine, error
+    #                          formatting. Schema rewrite needed.
+    #   - typescript 5 -> 6:   TS 6 ships stricter lib defaults + new
+    #                          checks; CI typecheck failed on the
+    #                          dependabot PR. Defer the upgrade.
+    #   - @types/node >=21:    runtime is pinned to Node 20 LTS via
+    #                          engines.node. Type-package major should
+    #                          track the Node major actually deployed.
     ignore:
       - dependency-name: "jose"
         versions: [">=6.0.0"]
       - dependency-name: "zod"
         versions: [">=4.0.0"]
+      - dependency-name: "typescript"
+        versions: [">=6.0.0"]
+      - dependency-name: "@types/node"
+        versions: [">=21.0.0"]
     groups:
       # Cluster minor+patch bumps together so they update in a single PR
       # instead of seven simultaneous tiny ones. MAJOR bumps are
