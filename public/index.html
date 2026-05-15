@@ -814,8 +814,8 @@
       const tag = buf[0];
       const sidLen = buf[1];
       if (sidLen === 0 || buf.length < 2 + sidLen) return null;
-      const sessionId = dec.decode(buf.slice(2, 2 + sidLen));
-      const payload = buf.slice(2 + sidLen);
+      const sessionId = dec.decode(buf.subarray(2, 2 + sidLen));
+      const payload = buf.subarray(2 + sidLen);
       return { tag, sessionId, payload };
     }
 

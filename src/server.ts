@@ -106,6 +106,10 @@ const PTY_ENV = {
 };
 const PTY_CWD = process.env['HOME'] ?? '/tmp';
 
+// Stable for the process lifetime — cache to avoid syscall on every WS open.
+const SERVER_USER = os.userInfo().username;
+const SERVER_HOST = os.hostname();
+
 // === static file serving ===================================================
 const PUBLIC_DIR = path.resolve(__dirname, '..', 'public');
 
@@ -120,16 +124,15 @@ const MIME: Readonly<Record<string, string>> = {
   '.ico': 'image/x-icon',
   '.woff2': 'font/woff2',
 };
-function mimeFor(p: string): string {
-  return MIME[path.extname(p).toLowerCase()] ?? 'application/octet-stream';
+function mimeFor(ext: string): string {
+  return MIME[ext] ?? 'application/octet-stream';
 }
 
 // Per-extension caching policy. Goal: keep `index.html` and `sw.js` always
 // revalidating (so deploys land instantly) while letting browsers reuse
 // the static assets that almost never change. ETag-based revalidation
 // means even the "no-cache" path benefits from 304s — no body re-sent.
-function cacheControlFor(p: string): string {
-  const ext = path.extname(p).toLowerCase();
+function cacheControlFor(ext: string): string {
   switch (ext) {
     case '.html':
     case '.js':
@@ -166,8 +169,9 @@ function sendFile(
   file: string,
   stat: fs.Stats,
 ): void {
+  const ext = path.extname(file).toLowerCase();
   const etag = etagFor(stat);
-  const cc = cacheControlFor(file);
+  const cc = cacheControlFor(ext);
   const inm = req.headers['if-none-match'];
   if (typeof inm === 'string' && inm === etag) {
     res.writeHead(304, { 'ETag': etag, 'Cache-Control': cc });
@@ -175,7 +179,7 @@ function sendFile(
     return;
   }
   res.writeHead(200, {
-    'Content-Type': mimeFor(file),
+    'Content-Type': mimeFor(ext),
     'Content-Length': stat.size,
     'Cache-Control': cc,
     'ETag': etag,
@@ -256,7 +260,48 @@ function clientIp(req: http.IncomingMessage): string {
 // Process start time — exposed via /health so monitors can detect restarts.
 const PROCESS_STARTED_AT = Date.now();
 
+// Security response headers, applied to every response (HTML, assets, errors,
+// /health). Set via setHeader before any writeHead so writeHead's explicit
+// headers (Content-Type, Cache-Control, ETag) merge cleanly on top.
+//
+// CSP notes:
+//   - 'unsafe-inline' on script-src/style-src is required because index.html
+//     ships inline <script>/<style> blocks and an onsubmit= handler. The
+//     real XSS defense remains the escapeHtml() discipline at every
+//     innerHTML write site; CSP here is defense-in-depth on the outer
+//     boundary (frame-ancestors, base-uri, form-action, connect-src).
+//   - cdn.jsdelivr.net is allowed for the xterm.js bundles loaded from
+//     index.html. Self-hosting + SRI hashes would be stricter but is a
+//     separate piece of work.
+//   - frame-ancestors 'none' is the headline win: kills clickjacking
+//     against the terminal UI (an iframe overlay tricking the user into
+//     typing a malicious command).
+const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  'Content-Security-Policy':
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; " +
+    "font-src 'self' data:; " +
+    "connect-src 'self'; " +
+    "worker-src 'self'; " +
+    "manifest-src 'self'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'none'; " +
+    "form-action 'none'",
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=()',
+};
+function applySecurityHeaders(res: http.ServerResponse): void {
+  for (const k of Object.keys(SECURITY_HEADERS)) {
+    res.setHeader(k, SECURITY_HEADERS[k]!);
+  }
+}
+
 const server = http.createServer((req, res) => {
+  applySecurityHeaders(res);
   // /health — unauthenticated liveness probe. Safe to expose because the
   // server is loopback-bound (HOST check at top of file); only processes
   // on the same box can hit this. Used by Docker HEALTHCHECK, systemd's
@@ -264,7 +309,6 @@ const server = http.createServer((req, res) => {
   if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
     const body = JSON.stringify({
       ok: true,
-      pid: process.pid,
       uptimeMs: Date.now() - PROCESS_STARTED_AT,
     });
     res.writeHead(200, {
@@ -368,72 +412,84 @@ const OUTPUT_BATCH_MS = (() => {
   return Number.isFinite(n) && n > 0 && n <= 100 ? n : 0;
 })();
 
-const pendingOutput = new WeakMap<ActivePty, { buf: Buffer; timer: NodeJS.Timeout | null }>();
+const pendingOutput = new WeakMap<ActivePty, { chunks: Buffer[]; total: number; timer: NodeJS.Timeout | null }>();
 
 function flushPendingOutput(entry: ActivePty): void {
   const p = pendingOutput.get(entry);
   if (!p) return;
   pendingOutput.delete(entry);
   if (p.timer !== null) clearTimeout(p.timer);
-  if (p.buf.length === 0) return;
-  const frame = encodeDataFrame(TAG.STDOUT, entry.id, p.buf);
+  if (p.total === 0) return;
+  // Single-chunk case skips the concat allocation entirely.
+  const merged = p.chunks.length === 1 ? p.chunks[0]! : Buffer.concat(p.chunks, p.total);
+  const frame = encodeDataFrame(TAG.STDOUT, entry.id, merged);
   broadcastToSubscribers(entry.id, frame);
 }
 
 function emitStdout(entry: ActivePty, buf: Buffer): void {
   const existing = pendingOutput.get(entry);
   if (existing) {
-    // Already a pending flush — append to it. Subsequent flushes will
-    // pick up the combined buffer.
-    existing.buf = Buffer.concat([existing.buf, buf]);
+    // Append to the chunk list — O(1) vs the previous O(n²) Buffer.concat
+    // on every chunk during a burst. We only concat once at flush time.
+    existing.chunks.push(buf);
+    existing.total += buf.length;
     return;
   }
   if (OUTPUT_BATCH_MS > 0) {
     const timer = setTimeout(() => flushPendingOutput(entry), OUTPUT_BATCH_MS);
-    pendingOutput.set(entry, { buf, timer });
+    pendingOutput.set(entry, { chunks: [buf], total: buf.length, timer });
   } else {
     // Microtask coalesce. Anything emitted later in this same Node tick
     // — typically a burst of small redraws from a single read() — gets
-    // appended to `buf` and flushed once at end-of-tick.
-    pendingOutput.set(entry, { buf, timer: null });
+    // appended to `chunks` and flushed once at end-of-tick.
+    pendingOutput.set(entry, { chunks: [buf], total: buf.length, timer: null });
     queueMicrotask(() => flushPendingOutput(entry));
   }
 }
 
-// Per-WS accounting of which sessions it's subscribed to. Used on WS close
-// to clean up cleanly even if the client didn't send session-close frames.
-const wsSubs = new WeakMap<WebSocket, Set<string>>();
-function getSubs(ws: WebSocket): Set<string> {
-  let s = wsSubs.get(ws);
-  if (!s) { s = new Set(); wsSubs.set(ws, s); }
-  return s;
+// Consolidated per-WS state. Created once in the upgrade handler and
+// torn down in ws.on('close'). All previous per-WS WeakMaps live here.
+interface WsState {
+  email: string;
+  sub: string;
+  ip: string;
+  alive: boolean;
+  lastBackpressureWarnAt: number;
+  subscribedSessions: Set<string>;
+  activeUploadIds: Set<string>;
+  openedAt: number;
+  bytesUp: number;
+  bytesDown: number;
+  sessionsOpened: Set<string>;
 }
+const wsStates = new WeakMap<WebSocket, WsState>();
 
 // Active uploads, keyed by uploadId. Per-WS and per-session counters are
 // derived from this map for concurrency limits.
 const uploads = new Map<string, Upload>();
-const wsUploadIds = new WeakMap<WebSocket, Set<string>>();
 const wsForUpload = new WeakMap<Upload, WebSocket>();
+// O(1) per-session count instead of scanning all uploads each upload-start.
+const sessionUploadCount = new Map<string, number>();
 
-function getUploadIds(ws: WebSocket): Set<string> {
-  let s = wsUploadIds.get(ws);
-  if (!s) { s = new Set(); wsUploadIds.set(ws, s); }
-  return s;
+function bumpSessionUploadCount(sessionId: string, delta: 1 | -1): void {
+  const n = (sessionUploadCount.get(sessionId) ?? 0) + delta;
+  if (n <= 0) sessionUploadCount.delete(sessionId);
+  else sessionUploadCount.set(sessionId, n);
 }
 function countWsUploads(ws: WebSocket): number {
-  return wsUploadIds.get(ws)?.size ?? 0;
+  return wsStates.get(ws)?.activeUploadIds.size ?? 0;
 }
 function countSessionUploads(sessionId: string): number {
-  let n = 0;
-  for (const u of uploads.values()) if (u.sessionId === sessionId) n++;
-  return n;
+  return sessionUploadCount.get(sessionId) ?? 0;
 }
 async function dropUpload(uploadId: string, reason: string): Promise<void> {
   const u = uploads.get(uploadId);
   if (!u) return;
+  const sessionId = u.sessionId;
   uploads.delete(uploadId);
+  bumpSessionUploadCount(sessionId, -1);
   const ws = wsForUpload.get(u);
-  if (ws) getUploadIds(ws).delete(uploadId);
+  if (ws) wsStates.get(ws)?.activeUploadIds.delete(uploadId);
   await cleanupUpload(u);
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'upload-failed', uploadId, code: 'aborted', message: reason }));
@@ -469,9 +525,7 @@ function injectStatus(sessionId: string, text: string): void {
 //                  flush that's never going to come.
 const BACKPRESSURE_SOFT_BYTES = 4 * 1024 * 1024;
 const BACKPRESSURE_HARD_BYTES = 16 * 1024 * 1024;
-// Per-WS warn-rate limiting: log only the first drop in any 30 s window
-// per connection so we don't fill journal with one line per dropped chunk.
-const lastBackpressureWarnAt = new WeakMap<WebSocket, number>();
+// Per-WS warn-rate limit (30 s) lives on WsState.lastBackpressureWarnAt.
 
 function broadcastToSubscribers(id: string, frame: Buffer): void {
   const a = active.get(id);
@@ -487,10 +541,11 @@ function broadcastToSubscribers(id: string, frame: Buffer): void {
       continue;
     }
     if (buf >= BACKPRESSURE_SOFT_BYTES) {
+      const state = wsStates.get(ws);
       const now = Date.now();
-      const last = lastBackpressureWarnAt.get(ws) ?? 0;
+      const last = state?.lastBackpressureWarnAt ?? 0;
       if (now - last > 30_000) {
-        lastBackpressureWarnAt.set(ws, now);
+        if (state) state.lastBackpressureWarnAt = now;
         log.warn({ session: id, buffered: buf }, '[ws] soft backpressure, dropping output frame');
       }
       continue;
@@ -559,28 +614,30 @@ function attachWsToSession(ws: WebSocket, id: string): void {
       const aa = active.get(entry.id);
       if (aa) {
         for (const ws of aa.subscribers) {
-          getSubs(ws).delete(entry.id);
+          wsStates.get(ws)?.subscribedSessions.delete(entry.id);
         }
       }
       active.delete(entry.id);
     });
   }
   a.subscribers.add(ws);
-  getSubs(ws).add(id);
-  // Connection accounting — for the close-line summary.
-  wsAccount.get(ws)?.sessionsOpened.add(id);
+  const state = wsStates.get(ws);
+  if (state) {
+    state.subscribedSessions.add(id);
+    state.sessionsOpened.add(id);
+  }
   broadcastClientCount(id);
 }
 
 function detachWsFromSession(ws: WebSocket, id: string, reason = 'detached'): void {
   const a = active.get(id);
   if (!a) {
-    getSubs(ws).delete(id);
+    wsStates.get(ws)?.subscribedSessions.delete(id);
     return;
   }
   a.subscribers.delete(ws);
   a.subscriberSizes.delete(ws);
-  getSubs(ws).delete(id);
+  wsStates.get(ws)?.subscribedSessions.delete(id);
   // Tell remaining subscribers (if any) the count just dropped.
   if (a.subscribers.size > 0) broadcastClientCount(id);
   // Re-compute the smallest-wins PTY size now that this subscriber's
@@ -674,9 +731,11 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
         active.delete(oldId);
         active.set(newId, a);
         for (const sub of a.subscribers) {
-          const subs = getSubs(sub);
-          subs.delete(oldId);
-          subs.add(newId);
+          const subs = wsStates.get(sub)?.subscribedSessions;
+          if (subs) {
+            subs.delete(oldId);
+            subs.add(newId);
+          }
         }
       }
       const notify = JSON.stringify({ type: 'session-renamed', oldId, newId });
@@ -768,7 +827,8 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
         return;
       }
       uploads.set(result.upload.id, result.upload);
-      getUploadIds(ws).add(result.upload.id);
+      bumpSessionUploadCount(result.upload.sessionId, +1);
+      wsStates.get(ws)?.activeUploadIds.add(result.upload.id);
       wsForUpload.set(result.upload, ws);
       ws.send(JSON.stringify({
         type: 'upload-ready',
@@ -845,8 +905,10 @@ function handleBinary(ws: WebSocket, raw: Buffer): void {
           return;
         }
         if (res.done) {
+          const sessionId = upload.sessionId;
           uploads.delete(upload.id);
-          getUploadIds(ws).delete(upload.id);
+          bumpSessionUploadCount(sessionId, -1);
+          wsStates.get(ws)?.activeUploadIds.delete(upload.id);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               type: 'upload-complete',
@@ -856,7 +918,7 @@ function handleBinary(ws: WebSocket, raw: Buffer): void {
           }
           // Visible status line into the terminal — easy to ack the upload
           // from inside the shell (looks like `[uploaded foo to /path/]`).
-          injectStatus(upload.sessionId, `[uploaded ${upload.name} to ${res.path}]`);
+          injectStatus(sessionId, `[uploaded ${upload.name} to ${res.path}]`);
           log.info(`[upload] ${upload.id} complete -> ${res.path}`);
         } else {
           // Periodic progress every 16 chunks (~1 MiB at 64 KiB chunks).
@@ -1008,7 +1070,6 @@ const wss = new WebSocketServer({
   maxPayload: 4 * 1024 * 1024,
   perMessageDeflate: false,
 });
-const wsAuth = new WeakMap<WebSocket, { email: string; sub: string }>();
 
 // === WS-protocol keepalive ================================================
 // Standard ws-library idiom: server pings every PING_INTERVAL_MS. Browsers
@@ -1022,15 +1083,15 @@ const wsAuth = new WeakMap<WebSocket, { email: string; sub: string }>();
 // above, used by the frontend's visibilitychange-driven probe for
 // faster-than-30s detection on PWA wake.
 const PING_INTERVAL_MS = 30_000;
-const wsAlive = new WeakMap<WebSocket, boolean>();
 const keepaliveTimer = setInterval(() => {
   for (const client of wss.clients) {
-    if (wsAlive.get(client) === false) {
+    const state = wsStates.get(client);
+    if (state && state.alive === false) {
       log.info(`[ws] keepalive: no pong, terminating dead connection`);
       try { client.terminate(); } catch { /* already gone */ }
       continue;
     }
-    wsAlive.set(client, false);
+    if (state) state.alive = false;
     try { client.ping(); } catch { /* connection closing */ }
   }
 }, PING_INTERVAL_MS);
@@ -1058,23 +1119,14 @@ uploadSweepTimer.unref();
 
 // Per-connection accounting. One log line is emitted at WS close with the
 // totals — easier to grep than streaming every byte transfer to the log.
-interface WsAccount {
-  ip: string;
-  email: string;
-  openedAt: number;
-  bytesUp: number;
-  bytesDown: number;
-  /** Set of every sessionId this WS subscribed to during its lifetime. */
-  sessionsOpened: Set<string>;
-}
-const wsAccount = new WeakMap<WebSocket, WsAccount>();
+// Counters and lifetime data live on WsState (single WeakMap lookup).
 function bumpUp(ws: WebSocket, n: number): void {
-  const a = wsAccount.get(ws);
-  if (a) a.bytesUp += n;
+  const s = wsStates.get(ws);
+  if (s) s.bytesUp += n;
 }
 function bumpDown(ws: WebSocket, n: number): void {
-  const a = wsAccount.get(ws);
-  if (a) a.bytesDown += n;
+  const s = wsStates.get(ws);
+  if (s) s.bytesDown += n;
 }
 
 server.on('upgrade', (req, socket, head) => {
@@ -1110,7 +1162,19 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wsAuth.set(ws, { email: result.email, sub: result.sub });
+      wsStates.set(ws, {
+        email: result.email,
+        sub: result.sub,
+        ip: clientIp(req),
+        alive: true,
+        lastBackpressureWarnAt: 0,
+        subscribedSessions: new Set(),
+        activeUploadIds: new Set(),
+        openedAt: Date.now(),
+        bytesUp: 0,
+        bytesDown: 0,
+        sessionsOpened: new Set(),
+      });
       wss.emit('connection', ws, req);
     });
   }).catch((err: unknown) => {
@@ -1122,24 +1186,17 @@ server.on('upgrade', (req, socket, head) => {
   });
 });
 
-wss.on('connection', (ws, req) => {
-  const auth = wsAuth.get(ws);
-  const ip = clientIp(req);
-  const email = auth?.email ?? '?';
-  wsAccount.set(ws, {
-    ip,
-    email,
-    openedAt: Date.now(),
-    bytesUp: 0,
-    bytesDown: 0,
-    sessionsOpened: new Set(),
-  });
+wss.on('connection', (ws, _req) => {
+  const state = wsStates.get(ws);
+  const ip = state?.ip ?? '?';
+  const email = state?.email ?? '?';
   log.info({ ip, email }, '[ws] open');
-  // Mark as alive so the keepalive timer doesn't kill us before we've
-  // had a chance to be pinged once. Each subsequent pong flips it back
-  // to true; missed pings flip it to false and then terminate.
-  wsAlive.set(ws, true);
-  ws.on('pong', () => wsAlive.set(ws, true));
+  // alive was initialized to true in the upgrade handler; pong flips it
+  // back to true after each ping, and the keepalive sweep flips it false.
+  ws.on('pong', () => {
+    const s = wsStates.get(ws);
+    if (s) s.alive = true;
+  });
   // Tell the client who it is and where it's coming from — frontend
   // displays this in the bottom #info-bar. user/host let the bottom bar
   // render a Claude-Code-style `user@host:cwd` status line.
@@ -1147,8 +1204,8 @@ wss.on('connection', (ws, req) => {
     type: 'connection-info',
     ip,
     email,
-    user: os.userInfo().username,
-    host: os.hostname(),
+    user: SERVER_USER,
+    host: SERVER_HOST,
   }));
 
   ws.on('message', (data: RawData, isBinary: boolean) => {
@@ -1184,18 +1241,18 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', (code, reason) => {
-    const subs = Array.from(wsSubs.get(ws) ?? []);
-    const ups = Array.from(wsUploadIds.get(ws) ?? []);
-    const acct = wsAccount.get(ws);
+    const s = wsStates.get(ws);
+    const subs = s ? Array.from(s.subscribedSessions) : [];
+    const ups = s ? Array.from(s.activeUploadIds) : [];
     log.info({
-      ip: acct?.ip,
-      email: acct?.email,
+      ip: s?.ip,
+      email: s?.email,
       code,
       reason: reason.toString() || undefined,
-      durationMs: acct ? Date.now() - acct.openedAt : undefined,
-      sessionsOpened: acct ? Array.from(acct.sessionsOpened) : [],
-      bytesUp: acct?.bytesUp,
-      bytesDown: acct?.bytesDown,
+      durationMs: s ? Date.now() - s.openedAt : undefined,
+      sessionsOpened: s ? Array.from(s.sessionsOpened) : [],
+      bytesUp: s?.bytesUp,
+      bytesDown: s?.bytesDown,
       activeSubs: subs.length,
       activeUploads: ups.length,
     }, '[ws] close');
@@ -1203,7 +1260,7 @@ wss.on('connection', (ws, req) => {
     for (const uploadId of ups) {
       dropUpload(uploadId, 'ws-closed').catch((err: unknown) => log.warn({ err }, '[upload] ws-close drop threw'));
     }
-    wsAccount.delete(ws);
+    wsStates.delete(ws);
   });
 
   ws.on('error', (err) => {

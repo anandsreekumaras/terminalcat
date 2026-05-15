@@ -116,6 +116,16 @@ export function sanitizeName(name: unknown, allowDot = false): { ok: true; name:
   return { ok: true, name };
 }
 
+// Short-TTL cache for tmux pane_current_path. The frontend polls cwd on
+// tab-switch and upload-start triggers another lookup — many rapid-fire
+// hits on the same session. 200ms dedupes the burst without holding stale
+// data long enough for the user to notice (cd happens on keystroke = stale
+// for ~200ms feels instant). Bounded at 64 entries to cap memory if many
+// sessions come and go.
+const CWD_CACHE_TTL_MS = 200;
+const CWD_CACHE_MAX = 64;
+const cwdCache = new Map<string, { cwd: string; cachedAt: number }>();
+
 /**
  * Ask tmux for a session's pane_current_path. Returns absolute path or null
  * (session missing / tmux error). Stat-checks that it's an existing dir.
@@ -123,6 +133,12 @@ export function sanitizeName(name: unknown, allowDot = false): { ok: true; name:
 export function getSessionCwd(sessionId: string): Promise<string | null> {
   return new Promise((resolve) => {
     if (!isValidSessionId(sessionId)) { resolve(null); return; }
+    const now = Date.now();
+    const cached = cwdCache.get(sessionId);
+    if (cached && now - cached.cachedAt < CWD_CACHE_TTL_MS) {
+      resolve(cached.cwd);
+      return;
+    }
     const child = spawn('tmux', ['display-message', '-p', '-t', sessionId, '#{pane_current_path}']);
     let out = ''; let err = '';
     child.stdout.on('data', (d) => { out += d.toString('utf8'); });
@@ -135,6 +151,12 @@ export function getSessionCwd(sessionId: string): Promise<string | null> {
       }
       const cwd = out.trim();
       if (!cwd || !path.isAbsolute(cwd)) { resolve(null); return; }
+      if (cwdCache.size >= CWD_CACHE_MAX) {
+        // Map iteration order = insertion order; evict oldest.
+        const oldest = cwdCache.keys().next().value;
+        if (oldest !== undefined) cwdCache.delete(oldest);
+      }
+      cwdCache.set(sessionId, { cwd, cachedAt: now });
       resolve(cwd);
     });
   });
@@ -148,7 +170,11 @@ function parseMode(mode: string | undefined): number | null {
   if (mode === undefined) return 0o644;
   if (typeof mode !== 'string' || !/^0?[0-7]{3,4}$/.test(mode)) return null;
   // strip leading 0 to avoid double-octal weirdness; parseInt with radix 8.
-  return parseInt(mode, 8) & 0o7777;
+  // Mask to 0o0777 — drop setuid/setgid/sticky bits. Today the kernel ignores
+  // setuid on non-root-owned files so this isn't exploitable, but if the
+  // daemon ever runs as root or an uploaded binary later gets chowned, those
+  // bits become a privesc primitive. No legitimate upload needs them.
+  return parseInt(mode, 8) & 0o0777;
 }
 
 /**

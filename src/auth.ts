@@ -38,6 +38,15 @@ const JWKS = createRemoteJWKSet(jwksUrl, {
   timeoutDuration: 5_000,
 });
 
+// Verification result cache. Same token, ~4-6 static-asset hits per pageload
+// — we re-verify the same JWT each time. TTL well under typical JWT lifetime
+// (~6h) so we never serve a stale "ok" past the actual exp by more than the
+// TTL window. Failures are NOT cached: a recoverable failure (kid not yet
+// in JWKS, transient network) should retry.
+const VERIFY_CACHE_TTL_MS = 30_000;
+const VERIFY_CACHE_MAX = 1024;
+const verifyCache = new Map<string, { result: AuthOk; cachedAt: number }>();
+
 // JWKS prefetch (network-warm): a fire-and-forget fetch at module load so
 // the TLS session, DNS, and TCP for cloudflareaccess.com are warm before
 // the very first user request arrives. jose's own JWKS cache repopulates
@@ -54,6 +63,13 @@ export type AuthFail = { ok: false; reason: string };
 export type AuthResult = AuthOk | AuthFail;
 
 export async function verifyAccessJwt(token: string): Promise<AuthResult> {
+  const now = Date.now();
+  const cached = verifyCache.get(token);
+  if (cached) {
+    if (now - cached.cachedAt < VERIFY_CACHE_TTL_MS) return cached.result;
+    verifyCache.delete(token);
+  }
+
   let payload: Awaited<ReturnType<typeof jwtVerify>>['payload'];
   try {
     ({ payload } = await jwtVerify(token, JWKS, {
@@ -75,7 +91,14 @@ export async function verifyAccessJwt(token: string): Promise<AuthResult> {
   if (typeof sub !== 'string' || !sub) {
     return { ok: false, reason: 'JWT missing sub claim' };
   }
-  return { ok: true, email, sub };
+  if (verifyCache.size >= VERIFY_CACHE_MAX) {
+    // Map iteration order is insertion order — evict the oldest entry.
+    const oldest = verifyCache.keys().next().value;
+    if (oldest !== undefined) verifyCache.delete(oldest);
+  }
+  const result: AuthOk = { ok: true, email, sub };
+  verifyCache.set(token, { result, cachedAt: now });
+  return result;
 }
 
 // Map jose's typed errors to short diagnostic strings. We log these but
