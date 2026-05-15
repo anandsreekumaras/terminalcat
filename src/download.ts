@@ -16,6 +16,7 @@ import * as net from 'node:net';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { errMsg } from './errors';
 
 export interface DownloadRequest {
   action: 'download';
@@ -93,7 +94,7 @@ export function startShimService(handlers: ShimHandlers): () => void {
           reply = { ok: false, error: `unknown action: ${(req as { action: string }).action}` };
         }
       } catch (err) {
-        reply = { ok: false, error: (err as Error).message };
+        reply = { ok: false, error: errMsg(err) };
       }
       replyAndEnd(reply);
     }

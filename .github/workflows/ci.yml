@@ -1,10 +1,7 @@
-# Minimal CI: just makes sure the TypeScript still type-checks cleanly on
-# every push and pull request to main. Catches the "broke types in a hurry"
-# class of regression before it lands.
+# CI: typecheck + vitest on every push and PR to main.
 #
-# Future expansions (not now): a real test suite (vitest), a lint job
-# (eslint), node-pty smoke test on multiple Node versions. Spec defers
-# the full test suite to post-v2.
+# Future expansions: a lint job (eslint/biome) and node-pty smoke tests
+# on multiple Node versions.
 
 name: CI
 
@@ -53,3 +50,6 @@ jobs:
 
       - name: Type check
         run: pnpm exec tsc --noEmit
+
+      - name: Test
+        run: pnpm test

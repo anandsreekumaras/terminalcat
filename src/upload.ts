@@ -18,6 +18,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { errMsg } from './errors';
 import { isValidSessionId } from './protocol';
 
 export const MAX_UPLOAD_SIZE = 500 * 1024 * 1024;        // 500 MiB
@@ -65,6 +66,18 @@ export interface Upload {
   fd: fs.promises.FileHandle;
   /** Wall-clock when the upload was issued (used by an inactivity sweeper). */
   startedAt: number;
+  /** Wall-clock of the most recent successful chunk write (sweeper input). */
+  lastActivityAt: number;
+  /**
+   * Set synchronously inside appendChunk the moment we know the final
+   * chunk has arrived (bytesReceived will hit expectedSize), BEFORE any
+   * await for fsync/close/rename. Callers must check this on every chunk
+   * dispatch — see server.ts FILE_UP_CHUNK handler — so a stray chunk
+   * arriving during the async finalise window doesn't get fed into a
+   * closed fd. Closes the race between "appendChunk returns done" and
+   * "server deletes from uploads map".
+   */
+  completed: boolean;
 }
 
 /**
@@ -185,7 +198,7 @@ export async function startUpload(
       return { ok: false, code: 'cwd-stat-failed', message: `${cwd} is not a directory` };
     }
   } catch (err) {
-    return { ok: false, code: 'cwd-stat-failed', message: (err as Error).message };
+    return { ok: false, code: 'cwd-stat-failed', message: errMsg(err) };
   }
 
   const finalPath = path.resolve(cwd, named.name);
@@ -210,9 +223,10 @@ export async function startUpload(
   try {
     fd = await fs.promises.open(tmpPath, 'wx', mode);
   } catch (err) {
-    return { ok: false, code: 'open-failed', message: `${tmpPath}: ${(err as Error).message}` };
+    return { ok: false, code: 'open-failed', message: `${tmpPath}: ${errMsg(err)}` };
   }
 
+  const now = Date.now();
   const upload: Upload = {
     id: newId('u'),
     sessionId: args.sessionId,
@@ -224,7 +238,9 @@ export async function startUpload(
     expectedSeq: 0,
     mode,
     fd,
-    startedAt: Date.now(),
+    startedAt: now,
+    lastActivityAt: now,
+    completed: false,
   };
   return { ok: true, upload };
 }
@@ -241,6 +257,12 @@ export type ChunkResult =
   | { error: string };
 
 export async function appendChunk(upload: Upload, seq: number, data: Buffer): Promise<ChunkResult> {
+  if (upload.completed) {
+    // Completion was already detected synchronously — fd is being closed
+    // or has been closed. Drop quietly; the caller's `if (upload.completed)`
+    // check normally catches this first, but belt-and-braces.
+    return { error: 'upload already completed' };
+  }
   if (seq !== upload.expectedSeq) {
     return { error: `seq mismatch: got ${seq}, expected ${upload.expectedSeq}` };
   }
@@ -250,14 +272,23 @@ export async function appendChunk(upload: Upload, seq: number, data: Buffer): Pr
   if (next > upload.expectedSize) {
     return { error: `size overflow: declared ${upload.expectedSize}, would be ${next}` };
   }
+  // Mark the final chunk synchronously, BEFORE the first await. Any
+  // chunk frame the server happens to dispatch into appendChunk during
+  // the upcoming fsync/close/rename will hit the `upload.completed`
+  // guard above and bail out cleanly instead of trying to fd.write
+  // into a closed handle.
+  const isFinal = next === upload.expectedSize;
+  if (isFinal) upload.completed = true;
+
   try {
     await upload.fd.write(data);
   } catch (err) {
-    return { error: `write failed: ${(err as Error).message}` };
+    return { error: `write failed: ${errMsg(err)}` };
   }
   upload.bytesReceived = next;
+  upload.lastActivityAt = Date.now();
 
-  if (upload.bytesReceived === upload.expectedSize) {
+  if (isFinal) {
     try {
       await upload.fd.sync();
       await upload.fd.close();
@@ -267,7 +298,7 @@ export async function appendChunk(upload: Upload, seq: number, data: Buffer): Pr
       await fs.promises.rename(upload.tmpPath, upload.finalPath);
       return { done: true, path: upload.finalPath };
     } catch (err) {
-      return { error: `finalise failed: ${(err as Error).message}` };
+      return { error: `finalise failed: ${errMsg(err)}` };
     }
   }
   return { done: false };

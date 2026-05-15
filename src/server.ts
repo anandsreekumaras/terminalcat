@@ -27,6 +27,7 @@ import type * as pty from 'node-pty';
 
 import { config } from './config';
 import { log } from './log';
+import { errMsg } from './errors';
 import { parseControl } from './schema';
 import { verifyAccessJwt, type AuthResult } from './auth';
 import { randomBytes } from 'node:crypto';
@@ -252,7 +253,29 @@ function clientIp(req: http.IncomingMessage): string {
   return req.socket.remoteAddress ?? '?';
 }
 
+// Process start time — exposed via /health so monitors can detect restarts.
+const PROCESS_STARTED_AT = Date.now();
+
 const server = http.createServer((req, res) => {
+  // /health — unauthenticated liveness probe. Safe to expose because the
+  // server is loopback-bound (HOST check at top of file); only processes
+  // on the same box can hit this. Used by Docker HEALTHCHECK, systemd's
+  // `ExecStartPre=curl`, and our own watchdog scripts.
+  if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/health') {
+    const body = JSON.stringify({
+      ok: true,
+      pid: process.pid,
+      uptimeMs: Date.now() - PROCESS_STARTED_AT,
+    });
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(body, 'utf8'),
+      'Cache-Control': 'no-store',
+    });
+    if (req.method === 'HEAD') { res.end(); return; }
+    res.end(body);
+    return;
+  }
   authenticateRequest(req).then((result) => {
     if (!result.ok) {
       log.warn(
@@ -512,13 +535,15 @@ function attachWsToSession(ws: WebSocket, id: string): void {
     log.info(`[pty] session=${id} spawned client pid=${child.pid}`);
     // First spawn typically starts the tmux server. Re-run mouse-on now
     // so we don't depend on whether the server already existed.
-    void ensureTmuxMouseOn();
+    ensureTmuxMouseOn().catch((err: unknown) => log.warn({ err }, '[tmux] ensureMouseOn failed'));
 
     child.onData((data) => {
       // node-pty's d.ts insists `data: string` regardless of `encoding: null`
-      // we set on spawn — at runtime it hands us a Buffer. Cast and skip the
-      // string→Buffer round-trip we used to do here.
-      const buf = data as unknown as Buffer;
+      // we set on spawn — at runtime it hands us a Buffer. Check defensively
+      // so a future node-pty version that actually delivers strings doesn't
+      // blow up on `.subarray()` etc.; the typecheck is one branch in a
+      // hot path and the false-string-branch coerces once.
+      const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
       // Use entry.id (mutable) so renames take effect. Don't capture
       // the original id by closure.
       emitStdout(entry, buf);
@@ -601,7 +626,7 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
         const sessions = await listSessions();
         ws.send(JSON.stringify({ type: 'session-list', sessions }));
       } catch (err) {
-        sendError(ws, 'tmux-failed', `list-sessions: ${(err as Error).message}`);
+        sendError(ws, 'tmux-failed', `list-sessions: ${errMsg(err)}`);
       }
       return;
     }
@@ -622,7 +647,7 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
         await killTmuxSession(msg.id);
         ws.send(JSON.stringify({ type: 'session-killed', id: msg.id }));
       } catch (err) {
-        sendError(ws, 'kill-failed', (err as Error).message);
+        sendError(ws, 'kill-failed', errMsg(err));
       }
       return;
     }
@@ -640,7 +665,7 @@ async function handleControl(ws: WebSocket, raw: unknown): Promise<void> {
       try {
         await renameTmuxSession(oldId, newId);
       } catch (err) {
-        sendError(ws, 'rename-failed', (err as Error).message);
+        sendError(ws, 'rename-failed', errMsg(err));
         return;
       }
       const a = active.get(oldId);
@@ -802,14 +827,21 @@ function handleBinary(ws: WebSocket, raw: Buffer): void {
         // Drop quietly to avoid log spam.
         return;
       }
+      if (upload.completed) {
+        // The final chunk has already flipped the synchronous completion
+        // marker — we're inside the async finalise window (fsync/close/
+        // rename) and uploads.delete() hasn't fired yet. A stray chunk
+        // here would hit a closed fd. Drop quietly.
+        return;
+      }
       // Defense: only the WS that started the upload may feed it.
       if (wsForUpload.get(upload) !== ws) {
         log.warn(`[upload] chunk for ${inner.id} from foreign WS, dropping`);
         return;
       }
-      void appendChunk(upload, inner.seq, inner.data).then((res) => {
+      appendChunk(upload, inner.seq, inner.data).then((res) => {
         if ('error' in res) {
-          void dropUpload(upload.id, res.error);
+          dropUpload(upload.id, res.error).catch((e: unknown) => log.warn({ err: e }, '[upload] dropUpload threw'));
           return;
         }
         if (res.done) {
@@ -837,7 +869,7 @@ function handleBinary(ws: WebSocket, raw: Buffer): void {
           }
         }
       }).catch((err: unknown) => {
-        void dropUpload(upload.id, (err as Error).message);
+        dropUpload(upload.id, errMsg(err)).catch((e: unknown) => log.warn({ err: e }, '[upload] dropUpload threw'));
       });
       return;
     }
@@ -866,7 +898,7 @@ async function performDownload(req: DownloadRequest): Promise<ShimReply> {
   try {
     stat = await fs.promises.stat(req.path);
   } catch (err) {
-    return { ok: false, error: `stat ${req.path}: ${(err as Error).message}` };
+    return { ok: false, error: `stat ${req.path}: ${errMsg(err)}` };
   }
   if (!stat.isFile()) return { ok: false, error: `not a regular file: ${req.path}` };
   if (stat.size > MAX_DOWNLOAD_SIZE) {
@@ -897,11 +929,12 @@ async function performDownload(req: DownloadRequest): Promise<ShimReply> {
   try {
     fd = await fs.promises.open(req.path, 'r');
   } catch (err) {
+    const m = errMsg(err);
     const failMsg = JSON.stringify({
-      type: 'download-failed', downloadId, code: 'open', message: (err as Error).message,
+      type: 'download-failed', downloadId, code: 'open', message: m,
     });
     for (const ws of a.subscribers) if (ws.readyState === WebSocket.OPEN) ws.send(failMsg);
-    return { ok: false, error: (err as Error).message };
+    return { ok: false, error: m };
   }
 
   let seq = 0;
@@ -937,11 +970,12 @@ async function performDownload(req: DownloadRequest): Promise<ShimReply> {
     injectStatus(req.sessionId, `[downloading ${name} (${stat.size} bytes)]`);
     return { ok: true, result: { downloadId, sent } };
   } catch (err) {
+    const m = errMsg(err);
     const failMsg = JSON.stringify({
-      type: 'download-failed', downloadId, code: 'stream', message: (err as Error).message,
+      type: 'download-failed', downloadId, code: 'stream', message: m,
     });
     for (const ws of a.subscribers) if (ws.readyState === WebSocket.OPEN) ws.send(failMsg);
-    return { ok: false, error: (err as Error).message };
+    return { ok: false, error: m };
   } finally {
     try { await fd.close(); } catch { /* */ }
   }
@@ -1001,6 +1035,26 @@ const keepaliveTimer = setInterval(() => {
   }
 }, PING_INTERVAL_MS);
 keepaliveTimer.unref(); // don't block process exit on this timer
+
+// === upload inactivity sweeper ============================================
+// A client that starts an upload and then vanishes mid-stream (network drop
+// before WS close fires, mobile carrier idle, etc.) leaves us holding an
+// open fd + a .uploading temp file forever. Walk the uploads map every
+// UPLOAD_SWEEP_INTERVAL_MS and drop anything that hasn't seen a chunk in
+// UPLOAD_IDLE_TIMEOUT_MS. dropUpload() closes the fd, unlinks the temp,
+// and notifies the WS if it's still around.
+const UPLOAD_SWEEP_INTERVAL_MS = 5 * 60_000;   // 5 minutes
+const UPLOAD_IDLE_TIMEOUT_MS   = 10 * 60_000;  // 10 minutes
+const uploadSweepTimer = setInterval(() => {
+  const cutoff = Date.now() - UPLOAD_IDLE_TIMEOUT_MS;
+  for (const u of uploads.values()) {
+    if (u.completed) continue;
+    if (u.lastActivityAt > cutoff) continue;
+    log.warn({ uploadId: u.id, idleMs: Date.now() - u.lastActivityAt }, '[upload] sweeping idle');
+    dropUpload(u.id, 'idle-timeout').catch((e: unknown) => log.warn({ err: e }, '[upload] sweep drop threw'));
+  }
+}, UPLOAD_SWEEP_INTERVAL_MS);
+uploadSweepTimer.unref();
 
 // Per-connection accounting. One log line is emitted at WS close with the
 // totals — easier to grep than streaming every byte transfer to the log.
@@ -1146,7 +1200,9 @@ wss.on('connection', (ws, req) => {
       activeUploads: ups.length,
     }, '[ws] close');
     for (const id of subs) detachWsFromSession(ws, id, 'ws-closed');
-    for (const uploadId of ups) void dropUpload(uploadId, 'ws-closed');
+    for (const uploadId of ups) {
+      dropUpload(uploadId, 'ws-closed').catch((err: unknown) => log.warn({ err }, '[upload] ws-close drop threw'));
+    }
     wsAccount.delete(ws);
   });
 
@@ -1155,34 +1211,43 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// Best-effort tmux config runner. None of these are load-bearing — if tmux
+// isn't installed yet or the server isn't up, the fix-up will re-run on
+// the next session spawn. But silently swallowing the rejection means a
+// real, persistent failure (typo, permission, broken tmux config) never
+// reaches the operator. Log a warn so it surfaces in the journal.
+function tmuxBestEffort(label: string, p: Promise<unknown>): void {
+  p.catch((err: unknown) => log.warn({ err }, `[tmux] ${label} failed`));
+}
+
 server.listen(PORT, HOST, () => {
   log.info(`terminalcat listening on http://${HOST}:${PORT}`);
   // Best-effort: turn on tmux's mouse mode so scrolling inside tmux moves
   // tmux's scrollback instead of sending ↑/↓ to the inner shell. Idempotent
   // and silent if no tmux server is running yet — first session-spawn
   // re-runs this.
-  void ensureTmuxMouseOn();
+  tmuxBestEffort('ensureMouseOn', ensureTmuxMouseOn());
   // Mouse-selection UX: by default tmux clears the highlight the moment
   // you release the drag. Rebind to keep it visible.
-  void keepTmuxSelectionAfterDrag();
+  tmuxBestEffort('keepSelectionAfterDrag', keepTmuxSelectionAfterDrag());
   // Bridge tmux's copy buffer to the browser's clipboard via OSC 52.
   // Without this, drag-copy lands only in tmux's internal buffer and
   // can't be pasted into anything outside the terminal.
-  void enableTmuxClipboard();
+  tmuxBestEffort('enableClipboard', enableTmuxClipboard());
   // tabs are our multiplexing UI — disable tmux's own split-pane keys so
   // accidentally hitting Ctrl-b % doesn't create a pane the user can't
   // reach via the tab bar.
-  void disableTmuxSplits();
+  tmuxBestEffort('disableSplits', disableTmuxSplits());
   // Right-click in the terminal area should show OUR browser-level menu,
   // not tmux's display-menu. Without this, both menus stack on right-click.
-  void disableTmuxRightClickMenu();
+  tmuxBestEffort('disableRightClickMenu', disableTmuxRightClickMenu());
   // We replace tmux's own green status bar with our own #info-bar in the
   // frontend, which can show client IP / device count / etc. that tmux
   // doesn't know about.
-  void disableTmuxStatus();
+  tmuxBestEffort('disableStatus', disableTmuxStatus());
   // Wheel-tick in copy-mode scrolls 1 line, not tmux's default 5. Stops
   // the "+5/-5 jump" feel when scrolling through scrollback.
-  void setTmuxScrollStepOne();
+  tmuxBestEffort('setScrollStepOne', setTmuxScrollStepOne());
 });
 
 // === shim socket (webdl / webnotify) =====================================
@@ -1216,7 +1281,9 @@ const shutdown = (sig: string): void => {
     log.info({ session: id }, '[server] SIGHUP pty');
     try { a.pty.kill('SIGHUP'); } catch { /* dead */ }
   }
-  for (const u of uploads.values()) void cleanupUpload(u);
+  for (const u of uploads.values()) {
+    cleanupUpload(u).catch((err: unknown) => log.warn({ err, uploadId: u.id }, '[server] shutdown cleanupUpload threw'));
+  }
   server.close(() => {
     log.info('[server] http closed cleanly');
     process.exit(0);
